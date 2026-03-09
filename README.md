@@ -1,4 +1,4 @@
-# Explicit DI Container
+# Lite DI Container
 
 A lightweight, zero-magic Dependency Injection container for modern JavaScript and TypeScript.
 
