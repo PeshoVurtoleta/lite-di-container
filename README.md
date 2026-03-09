@@ -16,7 +16,7 @@ Unlike heavy frameworks that rely on decorators, reflection, or magic string par
 ## Installation
 
 ```bash
-npm install explicit-di-container
+npm install lite-di-container
 ```
 
 ## Quick Start
@@ -24,7 +24,7 @@ npm install explicit-di-container
 ### 1. Register your services
 
 ```javascript
-import { Container } from 'explicit-di-container';
+import { Container } from 'lite-di-container';
 
 const container = new Container();
 
