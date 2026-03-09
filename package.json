@@ -1,0 +1,37 @@
+{
+  "name": "lite-di-container",
+  "version": "1.0.0",
+  "author": "Zahary Shinikchiev <shinikchiev@yahoo.com>",
+  "description": "A lightweight, zero-magic Dependency Injection container for modern JavaScript and TypeScript with boot-time graph validation.",
+  "type": "module",
+  "main": "Container.js",
+  "types": "Container.d.ts",
+  "exports": {
+    ".": {
+      "types": "./Container.d.ts",
+      "import": "./Container.js",
+      "default": "./Container.js"
+    }
+  },
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "files": ["Container.js", "Container.d.ts", "README.md"],
+  "keywords": [
+    "di",
+    "dependency injection",
+    "ioc",
+    "container",
+    "lightweight",
+    "typescript",
+    "validation"
+  ],
+  "license": "MIT",
+  "devDependencies": {
+    "vitest": "^1.0.0"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  }
+}
