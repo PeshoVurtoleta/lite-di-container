@@ -303,6 +303,27 @@ describe('DI Container', () => {
             expect(() => container.get('dynamic'))
                 .toThrow(/not registered/);
         });
+
+        it('covers visited node optimization in cycle detection (shared dependencies)', () => {
+            // Diamond dependency graph:
+            //   A depends on B and C
+            //   B depends on D
+            //   C depends on D
+            class D {}
+            class C { constructor(d) {} }
+            class B { constructor(d) {} }
+            class A { constructor(b, c) {} }
+
+            container.singleton('d', D);
+            container.transient('c', C, ['d']);
+            container.transient('b', B, ['d']);
+            container.transient('a', A, ['b', 'c']);
+
+            // When _detectCycles checks 'a', it will verify 'b' -> 'd'.
+            // Then it will verify 'c' -> 'd'.
+            // Since 'd' was already verified, `if (visited.has(name)) return;` is executed.
+            expect(() => container.boot()).not.toThrow();
+        });
     });
 
     // ── Boot lock ────────────────────────────────────────
@@ -486,6 +507,21 @@ describe('DI Container', () => {
             expect(d.a.name).toBe('A');
             expect(d.c.b.a.name).toBe('A');
             expect(d.a).toBe(d.c.b.a); // same singleton
+        });
+    });
+
+    describe('error handling', () => {
+        it('throws an error if the registry contains an unknown type (defensive safeguard)', () => {
+            // Forcefully inject a corrupted record into the internal map
+            // (assuming your map is called `_registry` or `registry` — adjust if it's named differently)
+            container._registry.set('corrupt_service', {
+                type: 'MAGIC_UNKNOWN_TYPE',
+                definition: class {},
+                dependencies: []
+            });
+
+            // Trying to resolve it should trigger the default switch case (Line 184)
+            expect(() => container.get('corrupt_service')).toThrowError(/unknown type "MAGIC_UNKNOWN_TYPE"/);
         });
     });
 });

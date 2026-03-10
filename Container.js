@@ -257,10 +257,8 @@ class Container {
             chain.push(name);
 
             const entry = this._registry.get(name);
-            if (entry) {
-                for (const dep of entry.dependencies) {
-                    visit(dep, [...chain]);
-                }
+            for (const dep of entry.dependencies) {
+                visit(dep, [...chain]);
             }
 
             stack.delete(name);
