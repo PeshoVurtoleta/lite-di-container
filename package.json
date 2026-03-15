@@ -1,6 +1,6 @@
 {
   "name": "lite-di-container",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "author": "Zahary Shinikchiev <shinikchiev@yahoo.com>",
   "description": "A lightweight, zero-magic Dependency Injection container for modern JavaScript and TypeScript with boot-time graph validation.",
   "type": "module",
@@ -32,6 +32,15 @@
     "validation"
   ],
   "license": "MIT",
+  "homepage": "https://github.com/PeshoVurtoleta/lite-di-container#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/PeshoVurtoleta/lite-di-container.git"
+  },
+  "bugs": {
+    "url": "https://github.com/PeshoVurtoleta/lite-di-container/issues",
+    "email": "shinikchiev@yahoo.com"
+  },
   "devDependencies": {
     "@vitest/coverage-v8": "^4.0.18",
     "copy-webpack-plugin": "^13.0.1",
