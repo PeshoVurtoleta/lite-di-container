@@ -4,8 +4,8 @@ A lightweight, zero-magic Dependency Injection container for modern JavaScript a
 
 [![npm version](https://img.shields.io/npm/v/lite-di-container.svg?style=for-the-badge&color=latest)](https://www.npmjs.com/package/lite-di-container)
 [![npm bundle size](https://img.shields.io/bundlephobia/minzip/lite-di-container?style=for-the-badge)](https://bundlephobia.com/result?p=lite-di-container)
-[![npm downloads](https://img.shields.io/npm/dm/@zakkster/lite-di-container?style=for-the-badge&color=blue)](https://www.npmjs.com/package/@zakkster/lite-di-container)
-[![npm total downloads](https://img.shields.io/npm/dt/@zakkster/lite-di-container?style=for-the-badge&color=blue)](https://www.npmjs.com/package/@zakkster/lite-smart-observer)
+[![npm downloads](https://img.shields.io/npm/dm/lite-di-container?style=for-the-badge&color=blue)](https://www.npmjs.com/package/lite-di-container)
+[![npm total downloads](https://img.shields.io/npm/dt/lite-di-container?style=for-the-badge&color=blue)](https://www.npmjs.com/package/lite-di-container)
 ![TypeScript](https://img.shields.io/badge/TypeScript-Types-informational)
 ![Zero Dependencies](https://img.shields.io/badge/dependencies-0-brightgreen)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=for-the-badge)](https://opensource.org/licenses/MIT)
