@@ -7,7 +7,7 @@
  */
 
 import { describe, it, expect, beforeEach } from 'vitest';
-import { Container } from '../Container.d.ts';
+import { Container } from '../Container.js';
 
 
 describe('DI Container', () => {
