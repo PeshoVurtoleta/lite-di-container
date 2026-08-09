@@ -1,6 +1,6 @@
 {
-  "name": "lite-di-container",
-  "version": "1.0.4",
+  "name": "@zakkster/lite-di-container",
+  "version": "2.0.0",
   "author": "Zahary Shinikchiev <shinikchiev@yahoo.com>",
   "description": "A lightweight, zero-magic Dependency Injection container for modern JavaScript and TypeScript with boot-time graph validation.",
   "type": "module",
@@ -16,12 +16,18 @@
     }
   },
   "scripts": {
-    "test": "vitest run",
-    "test:watch": "vitest"
+    "test": "node --expose-gc --test test/*.test.js",
+    "torture": "node --expose-gc test/torture.mjs",
+    "verify": "npm test && npm run torture",
+    "prepublishOnly": "npm run verify"
   },
   "files": [
     "Container.js",
     "Container.d.ts",
+    "LICENSE",
+    "llms.txt",
+    "CHANGELOG.md",
+    "COOKBOOK.md",
     "README.md"
   ],
   "keywords": [
@@ -49,6 +55,10 @@
     "url": "https://github.com/sponsors/PeshoVurtoleta"
   },
   "engines": {
-    "node": ">=16.0.0"
+    "node": ">=18"
+  },
+  "devDependencies": {
+    "@zakkster/lite-gc-profiler": "^1.15.0",
+    "@zakkster/lite-leak": "^1.8.1"
   }
 }
