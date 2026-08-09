@@ -463,6 +463,7 @@ describe('DI Container', () => {
                 'bootAsync',
                 'clear',
                 'constructor',
+                'describe',
                 'factory',
                 'factoryAsync',
                 'get',
@@ -937,6 +938,196 @@ describe('DI Container', () => {
             container._registry.set('corrupt', { type: 'MAGIC_UNKNOWN_TYPE' });
             // Restored fail-closed parity: a corrupt entry throws, never returns undefined.
             assert.throws(() => container.get('corrupt'), /unknown type/i);
+        });
+    });
+
+    // -- describe() introspection (2.1.0) -----------------------------------
+    describe('describe() introspection', () => {
+        class A {}
+        class B { constructor(a) { this.a = a; } }
+
+        // A-DESC-2: fail closed before boot.
+        it('A-DESC-2: throws before boot() (fail closed)', () => {
+            container.value('cfg', { k: 1 });
+            assert.equal(container.isBooted, false);
+            assert.throws(() => container.describe(), /not booted/i);
+        });
+
+        it('A-DESC-2: succeeds after boot()', () => {
+            container.value('cfg', { k: 1 });
+            container.boot();
+            const snap = container.describe();
+            assert.ok(Array.isArray(snap.nodes));
+            assert.ok(Array.isArray(snap.edges));
+            assert.ok(Array.isArray(snap.order));
+        });
+
+        // A-DESC-3: node count == _registry.size + multi entries.
+        it('A-DESC-3: node count == _registry.size + multi entries', () => {
+            container.value('cfg', 1);
+            container.singleton('a', A);
+            container.singleton('b', B, ['a']);
+            container.alias('nick', 'a');
+            container.multi('plugins', A);
+            container.multi('plugins', A);
+            container.boot();
+
+            const snap = container.describe();
+            let multiEntries = 0;
+            for (const [, entries] of container._multiRegistry) multiEntries += entries.length;
+
+            assert.equal(snap.nodes.length, container._registry.size + multiEntries);
+            assert.equal(multiEntries, 2);
+        });
+
+        // A-DESC-3: a VALUE node has kind === TYPES.VALUE and is absent from order.
+        it('A-DESC-3: a VALUE node has kind TYPES.VALUE and is absent from order', () => {
+            container.value('cfg', { port: 8080 });
+            container.singleton('a', A);
+            container.boot();
+
+            const snap = container.describe();
+            const cfg = snap.nodes.find((n) => n.token === 'cfg');
+            assert.equal(cfg.kind, TYPES.VALUE);
+            assert.deepEqual(cfg.deps, []);
+            assert.equal(cfg.opaqueDeps, true);
+            assert.equal(snap.order.includes('cfg'), false);
+            // The constructable node IS in the order.
+            assert.equal(snap.order.includes('a'), true);
+        });
+
+        // A-DESC-3: an ALIAS node points at its target, with an edge but no teardown.
+        it('A-DESC-3: an ALIAS node points at its target and is absent from order', () => {
+            container.singleton('a', A);
+            container.alias('nick', 'a');
+            container.boot();
+
+            const snap = container.describe();
+            const nick = snap.nodes.find((n) => n.token === 'nick');
+            assert.equal(nick.kind, TYPES.ALIAS);
+            assert.equal(nick.target, 'a');
+            assert.deepEqual(nick.deps, []);
+            assert.equal(snap.order.includes('nick'), false);
+            // The alias edge is present.
+            assert.ok(snap.edges.some((e) => e.from === 'nick' && e.to === 'a'));
+        });
+
+        // FACTORY deps are opaque (closure); flagged, no edges.
+        it('A-DESC-3: a FACTORY node reports opaqueDeps and no declared edges', () => {
+            container.factory('f', () => ({}));
+            container.boot();
+            const snap = container.describe();
+            const f = snap.nodes.find((n) => n.token === 'f');
+            assert.equal(f.kind, TYPES.FACTORY);
+            assert.deepEqual(f.deps, []);
+            assert.equal(f.opaqueDeps, true);
+            assert.equal(snap.edges.some((e) => e.from === 'f'), false);
+        });
+
+        // deps and edges are derived for constructable nodes.
+        it('order is a valid topological order (a dependency precedes its dependent)', () => {
+            container.singleton('a', A);
+            container.singleton('b', B, ['a']);
+            container.boot();
+            const snap = container.describe();
+            const b = snap.nodes.find((n) => n.token === 'b');
+            assert.deepEqual(b.deps, ['a']);
+            assert.ok(snap.edges.some((e) => e.from === 'b' && e.to === 'a'));
+            assert.ok(snap.order.indexOf('a') < snap.order.indexOf('b'));
+        });
+
+        // A-DESC-3: a cycle can never appear post-boot (boot would have thrown).
+        it('A-DESC-3: a cycle can never appear (boot rejects it first)', () => {
+            container.singleton('x', B, ['y']);
+            container.singleton('y', B, ['x']);
+            assert.throws(() => container.boot(), /circular/i);
+            // describe() is unreachable on a real container here (boot threw), but
+            // if forced past boot with a cycle present it fails closed, never hangs.
+            container._booted = true;
+            assert.throws(() => container.describe(), /circular/i);
+        });
+
+        // A-DESC-1: read-only -- describe() mutates no hot-path resolution state.
+        it('A-DESC-1: describe() is read-only (mutates no resolution state)', () => {
+            container.value('cfg', 1);
+            container.singleton('a', A);
+            container.boot();
+            container.get('a'); // populate _resolutionOrder / caches
+            const orderBefore = container._resolutionOrder.slice();
+            const pathLenBefore = container._path.length;
+            const cachedA = container.get('a');
+
+            container.describe();
+            container.describe();
+
+            assert.deepEqual(container._resolutionOrder, orderBefore);
+            assert.equal(container._path.length, pathLenBefore);
+            // The cached get() identity is unchanged after describe().
+            assert.equal(container.get('a'), cachedA);
+        });
+
+        // A-DESC-4: order must NOT lie -- it lists EXACTLY the cached instances
+        // that shutdown() tears down, in teardown-reverse order. A transient or a
+        // plain (non-cached) factory is in nodes/edges (the full DAG) but NEVER in
+        // order, because it is never pushed to _resolutionOrder and never torn down.
+        it('A-DESC-4: describe().order mirrors _resolutionOrder exactly (never lies)', async () => {
+            container.singleton('a', A);
+            container.singleton('b', B, ['a']);   // cached, deps on cached a
+            container.transient('t', A);          // never cached, never torn down
+            container.factory('f', () => ({}));   // plain factory, never cached
+            container.value('cfg', { k: 1 });     // value, never torn down
+            container.alias('nick', 'a');         // alias, never torn down
+            container.multi('plugins', A);        // multi, always cached
+            container.boot();
+
+            // Register teardown recorders on the teardown-eligible tokens.
+            const torn = [];
+            container.onTeardown('a', () => { torn.push('a'); });
+            container.onTeardown('b', () => { torn.push('b'); });
+            container.onTeardown('plugins', () => { torn.push('plugins'); });
+            // Recorders on tokens that must NEVER be torn down -- if they fire the
+            // order/teardown contract is broken.
+            container.onTeardown('t', () => { torn.push('t'); });
+            container.onTeardown('f', () => { torn.push('f'); });
+
+            // Resolve the WHOLE graph so _resolutionOrder is actually populated.
+            container.get('a');
+            container.get('b');
+            container.get('t');
+            container.get('f');
+            container.get('cfg');
+            container.get('nick');
+            container.getAll('plugins');
+
+            // Capture the predicted order and the real resolve-time order BEFORE
+            // shutdown (shutdown() releases _resolutionOrder).
+            const snap = container.describe();
+            const resolutionOrder = container._resolutionOrder.slice();
+
+            // describe().order equals the container's real _resolutionOrder snapshot.
+            assert.deepEqual(snap.order, resolutionOrder);
+
+            // The full DAG (nodes) DOES contain the transient and plain factory...
+            assert.ok(snap.nodes.some((n) => n.token === 't'));
+            assert.ok(snap.nodes.some((n) => n.token === 'f'));
+            // ...but order does NOT -- nor value/alias.
+            assert.equal(snap.order.includes('t'), false);
+            assert.equal(snap.order.includes('f'), false);
+            assert.equal(snap.order.includes('cfg'), false);
+            assert.equal(snap.order.includes('nick'), false);
+            // Cached tokens ARE present.
+            assert.equal(snap.order.includes('a'), true);
+            assert.equal(snap.order.includes('b'), true);
+            assert.equal(snap.order.includes('plugins'), true);
+
+            await container.shutdown();
+
+            // The ACTUAL teardown order equals describe().order REVERSED: order is
+            // the resolution order; teardown walks it in reverse.
+            assert.deepEqual(torn, snap.order.slice().reverse());
+            // No transient/plain-factory token was ever torn down.
+            assert.equal(torn.includes('t'), false);
+            assert.equal(torn.includes('f'), false);
         });
     });
 });

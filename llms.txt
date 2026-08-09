@@ -42,6 +42,9 @@ A token is a non-empty string OR a symbol. Anything else (empty string, undefine
 - `.hasLocal(name): boolean` -- registered on THIS container only (no parent walk).
 - `.isBooted: boolean` -- getter; has boot() locked the container.
 
+## Introspection (cold path)
+- `.describe(): { nodes, edges, order }` -- fresh read-only snapshot of the wiring graph. `nodes` is one entry per registration plus one per multi entry (`{ token, kind, deps }`; FACTORY/VALUE deps are opaque -- `deps: []`, `opaqueDeps: true`; ALIAS carries `target`). `edges` are `{ from, to }` from declared deps + alias targets. `order` is the predicted teardown order of CACHED instances only (reverse = teardown sequence); TRANSIENT, plain FACTORY, VALUE and ALIAS appear in nodes/edges but never in order. Fails closed: throws before boot(). Allocates fresh (never on a resolve lane).
+
 ## Validation and boot
 - `.boot(): void` -- validate the whole graph (collect ALL unregistered dependency/alias-target errors into one message), DFS-scan for cycles, then lock. Idempotent. Does NOT return this.
 - `.bootAsync(): Promise<void>` -- boot(), then eagerly build every cached async binding exactly once (concurrent construction deduped).

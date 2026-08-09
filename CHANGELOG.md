@@ -4,6 +4,35 @@ All notable changes to `@zakkster/lite-di-container` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/); this project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.1.0] - 2026-08-09
+
+### Added
+
+- **`describe()` -- read-only graph introspection.** A new cold-path method that
+  returns a fresh plain snapshot `{ nodes, edges, order }` of the wiring:
+  - `nodes`: one entry per registration in `_registry` plus one per multi entry,
+    each `{ token, kind, deps }` where `kind` is the `TYPES` integer tag. FACTORY
+    and VALUE nodes carry no declared dependencies (factory deps live in a closure;
+    a value is opaque), so their `deps` is `[]` and they are flagged
+    `opaqueDeps: true`. An ALIAS node additionally carries its `target`.
+  - `edges`: `{ from, to }` derived from each node's declared deps, plus one edge
+    from each alias to its target. An alias edge is not a teardown edge.
+  - `order`: the predicted teardown order of CACHED instances -- a RECOMPUTED
+    topological (post-order) list of exactly the tokens `shutdown()` tears down
+    (reverse of this order). It mirrors `_resolutionOrder` precisely: only cached
+    bindings (singleton, singletonFactory/-Async, and every multi) enter it, so
+    TRANSIENT, plain (non-cached) FACTORY, VALUE and ALIAS nodes appear in
+    `nodes`/`edges` but NEVER in `order` -- they are never cached and never torn
+    down. boot stores none (its cycle walk's `visited` set is local and discarded),
+    so `describe()` reruns the traversal SHAPE of the private cycle detector as a
+    pure local walk that mutates no container state.
+
+  PURELY ADDITIVE: the cached `get()` hot path is byte-identical to 2.0.0 (still
+  0.000 B/call) and no new instance field is consulted by any resolve lane.
+  Fails closed -- `describe()` throws before `boot()`, since the graph is only
+  meaningful once boot has validated it. A cycle can never appear post-boot; if
+  one somehow is present the walk throws rather than looping forever.
+
 ## [2.0.0] - 2026-08-09
 
 The 2.0.0 release. Every finding D-01..D-20 is closed; the three v2-regression DX

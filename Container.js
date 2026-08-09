@@ -9,7 +9,7 @@
  *  - Full integration testing lifecycle hooks (reset, unregister, clear).
  */
 
-const VERSION = '2.0.0';
+const VERSION = '2.1.0';
 
 const TYPES = Object.freeze({
     VALUE: 0,
@@ -605,6 +605,120 @@ class Container {
         }
 
         return instances;
+    }
+
+    // =======================================================
+    //  Introspection (Cold Path -- read-only, allocates fresh)
+    // =======================================================
+
+    // Read-only graph snapshot (2.1.0). PURELY ADDITIVE: touches NO hot-path
+    // field and adds NO instance field consulted by get()/_resolve*. Fails closed
+    // before boot -- the graph is only meaningful once boot() has validated it.
+    // boot() stores no order (the cycle walk's `visited` set is local and
+    // discarded; _resolutionOrder is a resolve-time teardown list, empty after a
+    // plain boot), so `order` is RECOMPUTED here by a local post-order walk that
+    // reuses the _detectCycles traversal SHAPE without mutating any container
+    // state. Allocation is fine here: this is a COLD path, never a resolve lane.
+    describe() {
+        if (!this._booted) {
+            throw new Error('describe: container is not booted. Call boot() first -- the graph is only meaningful after boot.');
+        }
+
+        const nodes = [];
+        const edges = [];
+
+        for (const [token, entry] of this._registry) {
+            nodes.push(this._describeNode(token, entry, edges));
+        }
+        for (const [token, entries] of this._multiRegistry) {
+            for (let i = 0; i < entries.length; i++) {
+                nodes.push(this._describeNode(token, entries[i], edges));
+            }
+        }
+
+        return { nodes, edges, order: this._describeOrder() };
+    }
+
+    // Build one snapshot node and append its edges. SINGLETON/TRANSIENT (and multi
+    // classes) carry declared deps -> real edges. FACTORY/VALUE carry no declared
+    // deps (factory deps live in a closure; value is opaque) -> deps:[] +
+    // opaqueDeps:true, no edges. ALIAS emits a single edge to its target and marks
+    // the node with that target; it is not a teardown edge. Cold path.
+    _describeNode(token, entry, edges) {
+        const kind = entry.type;
+        if (kind === TYPES.ALIAS) {
+            edges.push({ from: token, to: entry.target });
+            return { token, kind, deps: [], target: entry.target };
+        }
+        if (kind === TYPES.FACTORY || kind === TYPES.VALUE) {
+            return { token, kind, deps: [], opaqueDeps: true };
+        }
+        const src = entry.deps || [];
+        const len = src.length;
+        const deps = new Array(len);
+        for (let i = 0; i < len; i++) {
+            deps[i] = src[i];
+            edges.push({ from: token, to: src[i] });
+        }
+        return { token, kind, deps };
+    }
+
+    // Recompute the topological (post-order) resolution/teardown order that boot
+    // deliberately does not store. Reuses the _detectCycles traversal SHAPE as a
+    // pure LOCAL walk -- its visiting/visited sets are private to this call and it
+    // mutates no container state. VALUE and ALIAS return early on resolve and
+    // never enter _resolutionOrder, so they are absent from `order` here too. A
+    // cycle cannot occur post-boot (boot would have thrown); if one is somehow
+    // present, fail closed with a throw rather than loop forever.
+    _describeOrder() {
+        const order = [];
+        const visiting = new Set();
+        const visited = new Set();
+
+        const visit = (name) => {
+            if (visiting.has(name)) {
+                throw new Error(`describe: circular dependency detected at '${String(name)}'.`);
+            }
+            if (visited.has(name)) return;
+
+            visiting.add(name);
+            const single = this._registry.get(name);
+            const entries = single !== undefined ? [single] : this._multiRegistry.get(name);
+
+            if (entries) {
+                for (let i = 0; i < entries.length; i++) {
+                    const e = entries[i];
+                    if (e.type === TYPES.ALIAS) visit(e.target);
+                    else if (e.deps) {
+                        for (let j = 0; j < e.deps.length; j++) visit(e.deps[j]);
+                    }
+                }
+            }
+
+            visiting.delete(name);
+            visited.add(name);
+
+            if (single !== undefined) {
+                // Mirror the resolve-time push EXACTLY: get()/_buildAsync push a
+                // name onto _resolutionOrder IFF entry.isCached (~255, ~354).
+                // isCached is truthy only for singleton/singletonFactory/-Async and
+                // falsy for value/alias/transient/plain-factory -- so `order` lists
+                // ONLY tokens shutdown() actually tears down, never a transient or a
+                // plain (non-cached) factory that is never in _resolutionOrder.
+                if (single.isCached) order.push(name);
+            } else if (entries) {
+                // Every multi entry is registered through multi()/multiFactory(),
+                // both isCached:true (~163, ~168) -- a non-cached multi kind does
+                // not exist -- so getAll()/_resolveAllAsync ALWAYS push the multi
+                // name onto _resolutionOrder on first resolution (~410, ~500, ~575).
+                // The unconditional push here mirrors that reality.
+                order.push(name);
+            }
+        };
+
+        for (const name of this._registry.keys()) visit(name);
+        for (const name of this._multiRegistry.keys()) visit(name);
+        return order;
     }
 
     // =======================================================

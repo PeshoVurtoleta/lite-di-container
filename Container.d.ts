@@ -33,6 +33,68 @@ export type Constructor<T = any> = new (...args: any[]) => T;
  */
 export type Token = string | symbol;
 
+/**
+ * The integer entry-type tag of a snapshot node -- one of the {@link TYPES}
+ * values (`0 | 1 | 2 | 3 | 4`).
+ */
+export type NodeKind = typeof TYPES[keyof typeof TYPES];
+
+/**
+ * One node of a {@link Container.describe} snapshot. There is one node per
+ * single registration and one per multi-binding entry (so a multi token appears
+ * once per registered entry). `deps` is the declared constructor dependency list
+ * in order.
+ *
+ * FACTORY and VALUE nodes carry no declared dependencies -- a factory's deps live
+ * in its closure and a value is opaque -- so their `deps` is `[]` and they are
+ * flagged `opaqueDeps: true`. An ALIAS node additionally carries the `target` it
+ * resolves to (its edge to the target is not a teardown edge).
+ */
+export interface DescribeNode {
+    /** The registration token. */
+    token: Token;
+    /** The integer entry-type tag ({@link TYPES}). */
+    kind: NodeKind;
+    /** Declared constructor dependencies, in order. Always `[]` for FACTORY/VALUE/ALIAS. */
+    deps: Token[];
+    /** Present and `true` when deps are unknowable (FACTORY closure / opaque VALUE). */
+    opaqueDeps?: true;
+    /** Present on ALIAS nodes: the token this alias resolves to. */
+    target?: Token;
+}
+
+/**
+ * A directed dependency edge of a {@link Container.describe} snapshot, derived
+ * from a node's declared deps or from an alias to its target.
+ */
+export interface DescribeEdge {
+    /** The dependent token. */
+    from: Token;
+    /** The depended-upon token. */
+    to: Token;
+}
+
+/**
+ * The read-only snapshot returned by {@link Container.describe}. Allocated fresh
+ * on every call (a cold path).
+ */
+export interface DescribeSnapshot {
+    /** Every registration as a node (single registrations plus each multi entry). */
+    nodes: DescribeNode[];
+    /** Directed edges from each node's deps and each alias to its target. */
+    edges: DescribeEdge[];
+    /**
+     * The predicted teardown order of CACHED instances: a recomputed topological
+     * (post-order) list of exactly the tokens that {@link Container.shutdown} tears
+     * down, which walks this order in REVERSE. It mirrors `_resolutionOrder`
+     * precisely -- only cached bindings (singleton, singletonFactory/-Async, and
+     * every multi) enter it. TRANSIENT and plain (non-cached) FACTORY nodes, along
+     * with VALUE and ALIAS, appear in `nodes`/`edges` (the full DAG) but NEVER in
+     * `order`, because they are never cached and never torn down.
+     */
+    order: Token[];
+}
+
 export class Container {
     /**
      * Create a container. Pass no argument for a root; {@link scope} builds a
@@ -236,6 +298,30 @@ export class Container {
      * violations. `reset()` and `clear()` return it to `false`.
      */
     readonly isBooted: boolean;
+
+    // =======================================================
+    //  Introspection (cold path)
+    // =======================================================
+
+    /**
+     * Return a fresh, read-only snapshot of the dependency graph:
+     * `{ nodes, edges, order }`. Purely additive and cold -- it touches no
+     * hot-path field and allocates a new snapshot on every call.
+     *
+     * `nodes` has one entry per single registration and one per multi-binding
+     * entry; FACTORY/VALUE nodes report `deps: []` with `opaqueDeps: true`, and
+     * ALIAS nodes carry their `target`. `edges` are `{ from, to }` derived from
+     * declared deps and alias targets. `order` is a recomputed topological
+     * (post-order) list of exactly the CACHED tokens {@link shutdown} tears down
+     * (reverse of this order) -- boot stores none -- so TRANSIENT, plain FACTORY,
+     * VALUE and ALIAS nodes appear in `nodes`/`edges` but never in `order`.
+     *
+     * @returns The graph snapshot.
+     * @throws {Error} if the container is not booted (fail closed -- the graph is
+     *   only meaningful after {@link boot}), or if a cycle is somehow present
+     *   (which cannot happen post-boot, since boot would have thrown).
+     */
+    describe(): DescribeSnapshot;
 
     // =======================================================
     //  Validation & boot
