@@ -7,6 +7,8 @@
 ![Zero-GC](https://img.shields.io/badge/Zero--GC-Hot--Path-00C853?style=for-the-badge&logo=leaf&logoColor=white)
 [![npm bundle size](https://img.shields.io/bundlephobia/minzip/@zakkster/lite-di-container?style=for-the-badge)](https://bundlephobia.com/result?p=@zakkster/lite-di-container)
 [![npm downloads](https://img.shields.io/npm/dm/@zakkster/lite-di-container?style=for-the-badge&color=blue)](https://www.npmjs.com/package/@zakkster/lite-di-container)
+[![npm total downloads](https://img.shields.io/npm/dt/@zakkster/lite-di-container?style=for-the-badge&color=blue)](https://www.npmjs.com/package/@zakkster/lite-di-container)
+![Tree-Shakeable](https://img.shields.io/badge/tree--shakeable-yes-brightgreen)
 ![TypeScript](https://img.shields.io/badge/TypeScript-Types-informational)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=for-the-badge)](./LICENSE)
 
