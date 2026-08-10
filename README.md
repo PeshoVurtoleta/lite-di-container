@@ -361,9 +361,11 @@ the gate exit non-zero -- a budget that cannot fail is not a gate.
   the parent refuses to shut down while a child is live rather than leave the child
   holding a dead parent.
 - **The container ships alone** ([decisions/0004](./decisions/0004-signal-packaging.md)).
-  No signal / reactive exports and no `@zakkster/lite-signal` dependency in 2.0.0.
-  The reactive layer is deferred to a separate `@zakkster/lite-di-signal` in 2.1,
-  so the core stays zero-dependency and the reactive coupling is opt-in.
+  No signal / reactive exports and no `@zakkster/lite-signal` dependency in the
+  container itself. The reactive layer ships as its OWN package,
+  `@zakkster/lite-di-signal` -- duck-typed onto the container (zero hard peer, it
+  imports nothing from here), so the core stays zero-dependency and the reactive
+  coupling is opt-in. See the [Ecosystem](#ecosystem) map below.
 
 ---
 
@@ -406,8 +408,8 @@ that each prove a gate can fail. No gate output is a FAIL.
   inject through constructors. `get()` is for composition roots and factories, not
   for reaching into the container from deep in business logic.
 - **Not a reactive system.** The container does not observe or recompute. The
-  reactive layer (`@zakkster/lite-di-signal`) is a separate 2.1 package (decision
-  0004); it is not bundled here.
+  reactive layer (`@zakkster/lite-di-signal`) is a separate, duck-typed package
+  (decision 0004); it is not bundled here.
 - **Not a config loader, an HTTP framework, or a job runner.** Those live in the
   ecosystem dependents that consume this container, not in the container itself.
 
@@ -415,13 +417,131 @@ that each prove a gate can fail. No gate output is a FAIL.
 
 ## Ecosystem
 
-Part of the **@zakkster** zero-GC stack:
+This container is the base of the **`@zakkster/lite-di-*` service kernel** -- a
+self-healing, zero-GC backend service kernel assembled from single-file ESM bricks.
+The container owns resolution, boot-time validation, reverse-topological teardown,
+and post-boot `rebind` hot-swap; ten sibling modules layer capability on top of that
+one spine. **None of them takes a hard dependency on the container** -- every module
+duck-types it (`get` / `has` / `isBooted`) and ships with `dependencies: {}`. You add
+only the bricks a given service needs.
 
-- [`lite-signal`](https://www.npmjs.com/package/@zakkster/lite-signal) -- zero-GC reactive graph for hot paths
-- [`lite-leak`](https://www.npmjs.com/package/@zakkster/lite-leak) -- retention torture kernels (dev dep here)
-- [`lite-gc-profiler`](https://www.npmjs.com/package/@zakkster/lite-gc-profiler) -- allocation and GC budget gates (dev dep here)
+### The layers
+
+Each tier sits on the container and does exactly one job the tier below does not.
+
+```mermaid
+graph TD
+    subgraph process["process capstone"]
+        ORCH["lite-di-orchestrator<br/>SIGTERM -&gt; graceful shutdown"]
+    end
+    subgraph resilience["resilience"]
+        SUP["lite-di-supervisor<br/>restart trees"]
+        HEALTH["lite-di-health<br/>ready / live verdict"]
+        LOCK["lite-di-lock<br/>lease + fencing token"]
+    end
+    subgraph reactivity["reactivity"]
+        SIGNAL["lite-di-signal<br/>per-scope signal registry"]
+    end
+    subgraph cadence["lifecycle cadence"]
+        BUS["lite-di-event-bus<br/>zero-alloc fan-out"]
+        CRON["lite-di-cron<br/>wall-clock schedule"]
+        TICK["lite-di-ticker<br/>frame lanes"]
+    end
+    subgraph readpath["read path"]
+        STRAT["lite-di-strategies<br/>dispatch router"]
+        GRAPH["lite-di-graph<br/>describe() exporters"]
+    end
+    CORE["lite-di-container 2.2.0<br/>resolution + boot validation<br/>reverse-topo teardown + rebind"]
+
+    ORCH --> CORE
+    SUP --> CORE
+    HEALTH --> CORE
+    LOCK --> CORE
+    SIGNAL --> CORE
+    BUS --> CORE
+    CRON --> CORE
+    TICK --> CORE
+    STRAT --> CORE
+    GRAPH --> CORE
+```
+
+### One request's life
+
+Boot, serve, and retire a service -- the modules compose end to end, and every
+teardown runs in the container's reverse-topological order.
+
+```mermaid
+sequenceDiagram
+    participant P as process
+    participant O as orchestrator
+    participant St as strategies
+    participant Sv as supervisor
+    participant H as health
+    participant C as container
+
+    O->>C: bootAsync() validate graph + lock
+    O->>Sv: start supervision tree
+    Note over C,St: serving requests
+    St->>C: resolve(select(input)) -&gt; impl
+    Sv->>C: check() watches children (0 B/poll)
+    H->>Sv: readyz() reads the supervisor verdict
+    P-->>O: SIGTERM
+    O->>Sv: supervisor.shutdown()
+    O->>C: container.shutdown()
+    C->>C: reverse-topo teardown (each scope's signal registry destroyed LAST)
+    O->>P: exit(code) once
+```
+
+### Zero hard peers -- the selling point
+
+Every module reaches the container through the same tiny duck-typed surface and
+imports nothing from it. There are **no module-to-module hard arrows**: you can adopt
+any single brick without pulling the rest.
+
+```mermaid
+graph LR
+    C["lite-di-container<br/>get / has / isBooted"]
+
+    BUS["event-bus"] -.->|duck-types| C
+    CRON["cron"] -.->|duck-types| C
+    TICK["ticker"] -.->|duck-types| C
+    GRAPH["graph"] -.->|duck-types| C
+    STRAT["strategies"] -.->|duck-types| C
+    SUP["supervisor"] -.->|duck-types| C
+    HEALTH["health"] -.->|duck-types| C
+    LOCK["lock"] -.->|duck-types| C
+    ORCH["orchestrator"] -.->|duck-types| C
+    SIGNAL["signal"] -.->|duck-types + injected createRegistry| C
+```
+
+### What each module is for
+
+One row per module: the one job only it does, and the gap it closed in the kernel.
+Taglines are each package's own `llms.txt` positioning line.
+
+| Module | The one job only it does | Role |
+| ------ | ------------------------ | ---- |
+| **`lite-di-container`** `2.2.0` | resolution + boot-time graph validation + reverse-topo teardown + post-boot `invalidate`/`rebind` hot-swap | the base (rebind = GAP-3) |
+| `lite-di-strategies` | fail-closed zero-GC strategy router over a booted container | read-path dispatch hinge |
+| `lite-di-graph` | read-only JSON / Graphviz-DOT / Chrome-Trace exporters over a `describe()` snapshot | topology observability |
+| `lite-di-event-bus` | DI-constructed handlers under a boot-locked `multi`, dispatched by index over one bus buffer | zero-alloc fan-out |
+| `lite-di-cron` | wall-clock task scheduler over a DI topology | time-driven cadence |
+| `lite-di-ticker` | static, DI-wired system ticker for `lite-raf` frame lanes | frame-driven cadence |
+| `lite-di-supervisor` | OTP-style supervision tree over a DI topology | GAP-1, self-healing keystone |
+| `lite-di-health` | fail-closed readiness / liveness aggregator | GAP-4, readiness surface |
+| `lite-di-lock` | a DI-scoped lock lifecycle over a pluggable store | mutual-exclusion / lease hinge |
+| `lite-di-orchestrator` | graceful-shutdown / process-lifecycle capstone (SIGTERM -> drain -> exit once) | GAP-2, process capstone |
+| `lite-di-signal` | each container scope gets its own isolated `lite-signal` registry, destroyed on scope teardown | reactivity pillar (last brick) |
+
+### Shared foundation
+
+- [`lite-signal`](https://www.npmjs.com/package/@zakkster/lite-signal) -- zero-GC reactive graph; the registry `lite-di-signal` scopes (injected, never imported)
+- [`lite-leak`](https://www.npmjs.com/package/@zakkster/lite-leak) -- retention torture kernels (dev dep across the line)
+- [`lite-gc-profiler`](https://www.npmjs.com/package/@zakkster/lite-gc-profiler) -- allocation and GC budget gates (dev dep across the line)
 - **`@zakkster/lite-di-container`** -- this package (formerly unscoped `lite-di-container`, now deprecated)
-- `lite-di-signal` -- the reactive layer on top of this container, **planned for 2.1** (decision 0004)
+
+The ten sibling modules are published at `1.0.0-alpha.1` and are torture-green; their
+alpha-to-stable graduation is tracked in [`PROMOTION_LADDER.md`](./PROMOTION_LADDER.md).
 
 ---
 
