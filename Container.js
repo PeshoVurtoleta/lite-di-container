@@ -9,7 +9,7 @@
  *  - Full integration testing lifecycle hooks (reset, unregister, clear).
  */
 
-const VERSION = '2.1.0';
+const VERSION = '2.2.0';
 
 const TYPES = Object.freeze({
     VALUE: 0,
@@ -304,19 +304,34 @@ class Container {
         // async binding share ONE construction.
         if (entry.isCached && this._pending.has(name)) return this._pending.get(name);
 
-        const p = this._buildAsync(name, entry, ctx);
+        // Identity cell for the in-flight memo (decision 0005). _buildAsync caches
+        // ONLY if _pending STILL holds THIS build's promise -- not merely SOME
+        // promise for the name. Allocated only on a cold build; a cached HIT
+        // returns above and never reaches here, so the T6 async-hit lane is
+        // untouched.
+        const ref = entry.isCached ? { p: null } : null;
+        const p = this._buildAsync(name, entry, ctx, ref);
         if (entry.isCached) {
+            // ref.p is set BEFORE any awaited _buildAsync continuation runs (JS is
+            // single-threaded: _buildAsync returns its pending promise here, then
+            // this line executes, then microtasks resume the build), so the cache
+            // write always sees the correct identity.
+            ref.p = p;
             this._pending.set(name, p);
-            // Evict on settle (resolve OR reject). On resolve the value is
-            // already in _singletons; on reject nothing is cached, so a retry
-            // rebuilds -- no poisoned promise.
-            const evict = () => { this._pending.delete(name); };
+            // Evict on settle (resolve OR reject) -- but ONLY if _pending still
+            // holds THIS promise. Identity matters here too (decision 0005): after
+            // invalidate() drops A's memo and a newer build B repopulates it, A's
+            // settle must NOT delete B's memo (a bare delete-by-name would clobber
+            // B and make B fail its own cache-identity check -- the symmetric
+            // fail-open). On resolve the value is already in _singletons; on reject
+            // nothing is cached, so a retry rebuilds -- no poisoned promise.
+            const evict = () => { if (this._pending.get(name) === p) this._pending.delete(name); };
             p.then(evict, evict);
         }
         return p;
     }
 
-    async _buildAsync(name, entry, ctx) {
+    async _buildAsync(name, entry, ctx, ref) {
         ctx.path.push(name);
         let instance;
         try {
@@ -348,6 +363,21 @@ class Container {
             // (decision 0003), return the value to the caller but do NOT
             // resurrect the released caches -- retention must stay at zero.
             if (this._state === SHUT_DOWN) return instance;
+            // Decision 0005: cache ONLY if _pending STILL holds THIS build's own
+            // promise (identity, not mere presence). If invalidate()/rebind()
+            // dropped this build's memo while it awaited -- EVEN IF a newer build
+            // has since repopulated _pending[name] with its own promise -- the
+            // registration this build used is stale. Return the value to THIS
+            // caller (it is about to use it) but do NOT re-cache: the instance
+            // becomes a DETACHED instance the caller owns and the container no
+            // longer manages (never torn down at shutdown -- the mid-invalidate
+            // in-flight-caller edge, same family as the stale-dependent hazard). A
+            // bare has() test is a fail-OPEN here: build A settles, sees build B's
+            // memo present, and clobbers the slot with A's stale instance while
+            // B's escapes teardown. A normal build's memo is still current here
+            // (eviction runs on settle, after this write), so this never blocks a
+            // legitimate cache and never clobbers a concurrent build of the name.
+            if (this._pending.get(name) !== ref.p) return instance;
             // Symmetry with the sync lane: an undefined result IS cached, so the
             // factory runs exactly once even when it returns undefined.
             this._singletons.set(name, instance);
@@ -822,6 +852,51 @@ class Container {
         for (const name of this._multiRegistry.keys()) visit(name);
     }
 
+    // Single-token cycle check for rebind (decision 0005). Reuses the
+    // _detectCycles traversal SHAPE as a pure LOCAL walk that mutates no
+    // container state: when the walk reaches `name` it reads the CANDIDATE entry
+    // instead of the live registration, so a cycle the swap would introduce is
+    // caught BEFORE any mutation. boot() proved the existing graph acyclic, and a
+    // rebind only adds edges out of `name`, so any new cycle must pass back
+    // through `name` -- starting the DFS there and detecting a revisit on the
+    // active stack is sufficient. Parent-chain deps resolve to no local entry and
+    // terminate the walk, exactly as _detectCycles does. Cold path.
+    _checkRebindCycle(name, entry) {
+        const visiting = new Set();
+        const visited = new Set();
+
+        const visit = (n) => {
+            if (visiting.has(n)) {
+                throw new Error(`Cannot rebind '${String(name)}': introduces a circular dependency at '${String(n)}'.`);
+            }
+            if (visited.has(n)) return;
+
+            visiting.add(n);
+            let entries;
+            if (n === name) {
+                entries = [entry];
+            } else {
+                const single = this._registry.get(n);
+                entries = single !== undefined ? [single] : this._multiRegistry.get(n);
+            }
+
+            if (entries) {
+                for (let i = 0; i < entries.length; i++) {
+                    const e = entries[i];
+                    if (e.type === TYPES.ALIAS) visit(e.target);
+                    else if (e.deps) {
+                        for (let j = 0; j < e.deps.length; j++) visit(e.deps[j]);
+                    }
+                }
+            }
+
+            visiting.delete(n);
+            visited.add(n);
+        };
+
+        visit(name);
+    }
+
     // Detach this scope from its parent's live-child count. Idempotent: a scope
     // drains its parent exactly once even if both shutdown() and clear() run.
     _detachFromParent() {
@@ -829,6 +904,20 @@ class Container {
             this._detached = true;
             this._parent._liveChildren--;
         }
+    }
+
+    // The single-instance teardown ladder (decision 0003 / 0005). Extracted from
+    // shutdown()'s per-instance body so invalidate() runs the IDENTICAL sequence
+    // on a flushed instance: the _teardowns hook wins; otherwise Symbol.asyncDispose
+    // -> Symbol.dispose -> close() -> destroy(), first match only. Error isolation
+    // is the CALLER's job (shutdown collects into an AggregateError; invalidate
+    // lets the throw propagate) -- this method only runs the ladder. Cold path.
+    async _teardownOne(name, instance) {
+        if (this._teardowns.has(name)) await this._teardowns.get(name)(instance);
+        else if (Symbol.asyncDispose && typeof instance[Symbol.asyncDispose] === 'function') await instance[Symbol.asyncDispose]();
+        else if (Symbol.dispose && typeof instance[Symbol.dispose] === 'function') instance[Symbol.dispose]();
+        else if (typeof instance.close === 'function') await instance.close();
+        else if (typeof instance.destroy === 'function') await instance.destroy();
     }
 
     /**
@@ -889,11 +978,7 @@ class Container {
                 if (!instance) continue;
 
                 try {
-                    if (this._teardowns.has(name)) await this._teardowns.get(name)(instance);
-                    else if (Symbol.asyncDispose && typeof instance[Symbol.asyncDispose] === 'function') await instance[Symbol.asyncDispose]();
-                    else if (Symbol.dispose && typeof instance[Symbol.dispose] === 'function') instance[Symbol.dispose]();
-                    else if (typeof instance.close === 'function') await instance.close();
-                    else if (typeof instance.destroy === 'function') await instance.destroy();
+                    await this._teardownOne(name, instance);
                 } catch (err) {
                     // D-12: never console. Isolation preserved -- a thrower does
                     // not stop its siblings. Route to the hook, or collect.
@@ -962,6 +1047,137 @@ class Container {
         this._path.length = 0; // D-16
         this._state = LIVE;
         this._detachFromParent(); // a cleared scope is no longer live to its parent
+    }
+
+    // =======================================================
+    //  Post-boot hot-swap (decision 0005 -- Reading B, cold path)
+    // =======================================================
+
+    /**
+     * Flush a single cached instance so the next get(name) re-resolves FRESH from
+     * the SAME registration (decision 0005). The restart primitive: topology is
+     * unchanged, so boot's graph-validation invariant is preserved. Single-token
+     * only -- the STALE-DEPENDENT HAZARD (a service already built with `name` as a
+     * dep still holds the OLD instance) is the caller's / supervisor's problem;
+     * 2.2 does NOT cascade. Async because teardown may be async and the supervisor
+     * must await it before re-resolving. Fail-closed, in order:
+     *   (a) the container is not LIVE;
+     *   (b) `name` is registered neither as a single nor a multi binding;
+     *   (c) `name` is currently mid-resolution (on the active _path).
+     * Invalidating a registered-but-never-resolved name is a safe no-op. Cold path.
+     */
+    async invalidate(name) {
+        // (a) only a live container may be invalidated.
+        if (this._state !== LIVE) {
+            throw new Error(`Cannot invalidate '${String(name)}': container is not live.`);
+        }
+        // (b) the name must be registered somewhere.
+        if (!this._registry.has(name) && !this._multiRegistry.has(name)) {
+            throw this._notRegistered(name);
+        }
+        // (c) never flush a slot that is mid-resolution -- the active frame would
+        // re-cache a value into the slot we just cleared.
+        if (this._path.indexOf(name) !== -1) {
+            throw new Error(`Cannot invalidate '${String(name)}': it is mid-resolution (${this._path.join(' -> ')}).`);
+        }
+
+        // Drop the in-flight async build memo FIRST (CRITICAL, decision 0005): a
+        // racing cached getAsync() build memoized in _pending would otherwise
+        // settle AFTER this flush and re-cache a STALE instance into the slot we
+        // are clearing. Evicting the memo forces the next getAsync() to rebuild
+        // from the current registration.
+        this._pending.delete(name);
+
+        // Splice out of the teardown order exactly once (D-09): a re-resolution
+        // re-pushes `name`, so a stale entry left here would double its teardown.
+        const idx = this._resolutionOrder.indexOf(name);
+        if (idx !== -1) this._resolutionOrder.splice(idx, 1);
+
+        // Single cached instance: flush then run its teardown ladder.
+        if (this._singletons.has(name)) {
+            const instance = this._singletons.get(name);
+            this._singletons.delete(name);
+            if (instance) await this._teardownOne(name, instance);
+            return;
+        }
+
+        // Multi cached instances: flush the cache + flags, tear each down in turn
+        // (per-instance isolation mirrors shutdown()'s undefined-slot guard).
+        const cacheArr = this._multiSingletons.get(name);
+        if (cacheArr !== undefined) {
+            const flags = this._resolvedFlags.get(name);
+            this._multiSingletons.delete(name);
+            this._resolvedFlags.delete(name);
+            for (let j = 0; j < cacheArr.length; j++) {
+                const instance = cacheArr[j];
+                if (instance === undefined && (!flags || flags[j] !== 1)) continue;
+                if (!instance) continue;
+                await this._teardownOne(name, instance);
+            }
+        }
+        // else: registered but never resolved -> nothing cached -> safe no-op.
+    }
+
+    /**
+     * Atomically swap the registration for a single token on a BOOTED container,
+     * then invalidate its cached instance so the next get(name) re-resolves from
+     * the NEW entry (decision 0005 -- Reading B: constrained post-boot hot-swap).
+     * `entry` is an internal registry-entry object (the shape _register stores).
+     * All FIVE checks run BEFORE any mutation, so on ANY failure the registry is
+     * ATOMICALLY UNTOUCHED:
+     *   (1) the container is LIVE;
+     *   (2) `name` is not mid-resolution;
+     *   (3) same kind -- the existing registration is a single binding (a multi
+     *       cannot become a single, or vice-versa);
+     *   (4) every dependency of the new entry is already registered (single-token
+     *       slice of _validateWiring -- no whole-graph re-validation);
+     *   (5) the new entry introduces no cycle (single-token slice of _detectCycles).
+     * Cold path. Does NOT cascade to dependents (see invalidate: the stale-
+     * dependent hazard is the supervisor's problem, not 2.2's).
+     */
+    async rebind(name, entry) {
+        // (0) fail-closed shape guard: a rebind entry is a single internal registry
+        // entry object -- never null, never a multi array.
+        if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) {
+            throw new TypeError(`rebind: entry for '${String(name)}' must be a registry entry object.`);
+        }
+        // (1) only a live container may be rebound.
+        if (this._state !== LIVE) {
+            throw new Error(`Cannot rebind '${String(name)}': container is not live.`);
+        }
+        // (2) never swap a slot that is mid-resolution.
+        if (this._path.indexOf(name) !== -1) {
+            throw new Error(`Cannot rebind '${String(name)}': it is mid-resolution (${this._path.join(' -> ')}).`);
+        }
+        // (3) same kind: the existing registration must be a single binding. A
+        // multi cannot become a single; an unregistered name has no kind to keep.
+        if (this._multiRegistry.has(name)) {
+            throw new Error(`Cannot rebind '${String(name)}': it is a multi binding. rebind is single-token only.`);
+        }
+        if (!this._registry.has(name)) {
+            throw this._notRegistered(name);
+        }
+        // (4) every dependency / alias target of the NEW entry must already be
+        // registered (single-token slice of _validateWiring, not a full re-walk).
+        if (entry.type === TYPES.ALIAS) {
+            if (!this.has(entry.target)) {
+                throw new Error(`Cannot rebind '${String(name)}': alias target '${String(entry.target)}' is not registered.`);
+            }
+        } else if (entry.deps) {
+            for (let i = 0; i < entry.deps.length; i++) {
+                if (!this.has(entry.deps[i])) {
+                    throw new Error(`Cannot rebind '${String(name)}': dependency '${String(entry.deps[i])}' is not registered.`);
+                }
+            }
+        }
+        // (5) the new entry must not introduce a cycle.
+        this._checkRebindCycle(name, entry);
+
+        // All checks passed -- and ONLY now is any state touched. Swap the
+        // registration, then invalidate so the next get() builds from the new
+        // entry. Any throw above left the registry exactly as it was (atomic).
+        this._registry.set(name, entry);
+        await this.invalidate(name);
     }
 }
 

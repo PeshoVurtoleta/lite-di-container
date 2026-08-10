@@ -132,4 +132,64 @@ export async function run() {
                 () => `T7.D-09: resolution order grew to ${c._resolutionOrder.length}, expected 1`);
         }
     }
+
+    // ---- Sub-phase 3: the invalidate/get soak (decision 0005) --------------
+    // The banked 4096-cycle restart soak. get -> invalidate, repeated on a booted
+    // container: each invalidate flushes the cached instance and splices it out of
+    // _resolutionOrder, and the next get() re-pushes exactly one. The steady-state
+    // _resolutionOrder length must return to its baseline (1) every cycle, never
+    // grow -- and no flushed instance may be retained (lite-leak witnesses it).
+    {
+        const c = new Container();
+        let built = 0;
+        c.singletonFactory('svc', () => ({ id: ++built }));
+        c.boot();
+        // No pre-loop get(): each of the CYCLES iterations rebuilds exactly once,
+        // so built === CYCLES with no fudge. After each invalidate() the slot is
+        // flushed and spliced, so the steady-state _resolutionOrder length is 0.
+
+        const tracker3 = createLeakTracker({
+            name: 'di-invalidate-soak',
+            onWarning: () => { STATS.warnings++; },
+        });
+
+        globalThis.gc();
+        const heapBefore = process.memoryUsage().heapUsed;
+        let peakKB = 0;
+
+        for (let cyc = 0; cyc < CYCLES; cyc++) {
+            const inst = c.get('svc'); // cold rebuild every cycle (prev was flushed)
+            // Track the per-cycle instance; the tag/cleanup must NOT close over it.
+            const h = tracker3.track(inst, NOOP, cyc);
+            await c.invalidate('svc');
+            tracker3.untrack(h);
+
+            check(c._resolutionOrder.length === 0,
+                () => `T7.invalidate-soak: cycle ${cyc} resolution order is ${c._resolutionOrder.length} after invalidate, expected 0`);
+            check(c._singletons.has('svc') === false,
+                () => `T7.invalidate-soak: cycle ${cyc} left a stale cached instance after invalidate()`);
+            check(orderInvariant(c),
+                () => `T7.invalidate-soak: cycle ${cyc} broke orderInvariant`);
+
+            if ((cyc & 511) === 0) {
+                globalThis.gc();
+                const kb = (process.memoryUsage().heapUsed - heapBefore) / 1024;
+                if (kb > peakKB) peakKB = kb;
+            }
+        }
+
+        check(tracker3.size() === 0,
+            () => `T7.invalidate-soak: lite-leak tracker leaked ${tracker3.size()} instances`);
+        const findings3 = tracker3.audit();
+        check(findings3.length === 0,
+            () => `T7.invalidate-soak: lite-leak reported ${findings3.length} findings`);
+
+        globalThis.gc();
+        const grewKB = (process.memoryUsage().heapUsed - heapBefore) / 1024;
+        if (grewKB > peakKB) peakKB = grewKB;
+        check(peakKB < 512,
+            () => `T7.invalidate-soak: heap grew ${peakKB.toFixed(1)} KB over ${CYCLES} invalidate cycles`);
+        check(built === CYCLES,
+            () => `T7.invalidate-soak: expected ${CYCLES} rebuilds, got ${built}`);
+    }
 }

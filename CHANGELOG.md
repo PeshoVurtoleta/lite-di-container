@@ -4,6 +4,67 @@ All notable changes to `@zakkster/lite-di-container` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/); this project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.2.0] - 2026-08-10
+
+### Added
+
+- **`invalidate(name)` and `rebind(name, entry)` -- post-boot hot-swap
+  (decision 0005, Reading B).** The constrained restart / re-registration
+  primitives the `lite-di-supervisor` capstone is built on. Both are cold-path
+  only; the cached `get()` hot lane is BYTE-IDENTICAL to 2.1.0 (still 0.000
+  B/call, no new branch, no new instance field read by any resolve lane).
+
+  - **`invalidate(name): Promise<void>`** -- flush a single cached instance so the
+    next `get(name)` re-resolves FRESH from the SAME registration (topology
+    unchanged -> boot's graph-validation invariant preserved). Removes the cached
+    instance(s) from `_singletons` (or `_multiSingletons` + `_resolvedFlags`),
+    splices `name` out of `_resolutionOrder` exactly once (D-09 -- no double
+    teardown), and runs the shared teardown ladder on the flushed instance. Async
+    because a teardown may be async and the supervisor must await it before
+    re-resolving. Fails closed, in order: the container is not LIVE; `name` is
+    registered as neither a single nor a multi binding; `name` is mid-resolution
+    (on the active `_path`). Invalidating a registered-but-never-resolved name is a
+    safe no-op. **CRITICAL:** it evicts `name` from `_pending` FIRST, so a racing
+    in-flight async build cannot settle after the flush and re-cache a stale
+    instance into the cleared slot. Because dropping the memo alone is not enough
+    (an in-flight `_buildAsync` writes to `_singletons` unconditionally while
+    live), the async build now caches ONLY if `_pending` still holds THIS build's
+    own promise -- IDENTITY, not mere presence -- so a build orphaned by a
+    mid-flight invalidate cannot clobber a newer build that repopulated the memo
+    (the `evict` closure is identity-gated the same way). An orphaned build still
+    returns its value to its own caller, but that instance becomes a DETACHED
+    instance the caller owns and the container no longer manages (not torn down at
+    shutdown -- the mid-invalidate in-flight-caller edge). The multi async lane
+    (`getAllAsync`) is unaffected: it never re-sets its cache slot after an await,
+    so a mid-flight invalidate leaves the flushed slot flushed by construction.
+
+  - **`rebind(name, entry): Promise<void>`** -- atomically swap the single-token
+    registration on a booted container, then `invalidate(name)`, so the next
+    `get(name)` re-resolves from the NEW entry. `entry` is an internal
+    registry-entry object. ALL FIVE checks run BEFORE any mutation, so on any
+    failure the registry is ATOMICALLY UNTOUCHED: (1) the container is LIVE; (2)
+    `name` is not mid-resolution; (3) same kind -- the existing registration is a
+    single binding (a single cannot become a multi or vice-versa); (4) every
+    dependency / alias target of the new entry is already registered (a
+    single-token slice of `_validateWiring`, not a whole-graph re-walk); (5) the
+    new entry introduces no cycle (a single-token slice of the `_detectCycles`
+    traversal shape, run as a pure local walk that mutates no container state).
+
+  - **STALE-DEPENDENT HAZARD (documented, NOT auto-cascaded):** a service already
+    built with `name` as a dependency still holds the OLD instance. 2.2 is
+    SINGLE-TOKEN and does not cascade; transitive restart ordering is the future
+    supervisor's responsibility.
+
+### Internal
+
+- **`_teardownOne(name, instance)` extracted from `shutdown()`.** The per-instance
+  teardown ladder (`_teardowns` hook -> `Symbol.asyncDispose` -> `Symbol.dispose`
+  -> `close()` -> `destroy()`, first match only) is now one method that both
+  `shutdown()` and `invalidate()` call, so a flushed instance is torn down through
+  the IDENTICAL sequence. Error isolation stays with the caller (`shutdown()`
+  collects into an `AggregateError`; `invalidate()` lets the throw propagate).
+  `shutdown()`'s observable behavior and per-instance isolation are unchanged.
+
 ## [2.1.0] - 2026-08-09
 
 ### Added

@@ -40,6 +40,25 @@ export type Token = string | symbol;
 export type NodeKind = typeof TYPES[keyof typeof TYPES];
 
 /**
+ * An internal registry-entry object -- the shape the registrars store and the
+ * form {@link Container.rebind} accepts (decision 0005). The `type` tag selects
+ * which fields are meaningful: VALUE carries `value`; SINGLETON/TRANSIENT carry
+ * `Class` + `deps`; FACTORY carries `factory`; ALIAS carries `target`. `isAsync`
+ * / `isCached` mirror the resolution lane the registrars set. Construct one by
+ * hand when hot-swapping a single token post-boot.
+ */
+export interface RegistryEntry {
+    type: NodeKind;
+    value?: any;
+    Class?: Constructor;
+    deps?: Token[];
+    factory?: (container: Container) => any;
+    target?: Token;
+    isAsync?: boolean;
+    isCached?: boolean;
+}
+
+/**
  * One node of a {@link Container.describe} snapshot. There is one node per
  * single registration and one per multi-binding entry (so a multi token appears
  * once per registered entry). `deps` is the declared constructor dependency list
@@ -379,6 +398,45 @@ export class Container {
     shutdown(options?: {
         onTeardownError?: (error: unknown, name: string | symbol) => void;
     }): Promise<void>;
+
+    // =======================================================
+    //  Post-boot hot-swap (decision 0005 -- Reading B)
+    // =======================================================
+
+    /**
+     * Flush a single cached instance so the next {@link get} re-resolves fresh from
+     * the SAME registration (decision 0005). Topology is unchanged, so boot's
+     * graph-validation invariant is preserved. Single-token: a dependent already
+     * built with `name` still holds the OLD instance -- 2.2 does NOT cascade
+     * (that is the supervisor's job). Async because a teardown may be async.
+     *
+     * Removes the cached instance(s) from the singleton (or multi) cache, evicts
+     * any in-flight async build memo first (so a racing build cannot re-cache a
+     * stale instance), splices `name` out of the resolution order (no double
+     * teardown), and runs the teardown ladder on the flushed instance(s).
+     *
+     * Fails closed: throws if the container is not live, if `name` is registered
+     * neither as a single nor a multi binding, or if `name` is mid-resolution.
+     * Invalidating a registered-but-never-resolved name is a safe no-op.
+     *
+     * @param name The service token to flush.
+     */
+    invalidate(name: Token): Promise<void>;
+
+    /**
+     * Atomically swap the registration for a single token on a booted container,
+     * then {@link invalidate} it, so the next {@link get} re-resolves from the new
+     * entry (decision 0005 -- Reading B: constrained post-boot hot-swap). All five
+     * checks run BEFORE any mutation, so on any failure the registry is atomically
+     * untouched: the container is live; `name` is not mid-resolution; same kind
+     * (the existing registration is a single binding -- a single cannot become a
+     * multi or vice-versa); every dependency / alias target of the new entry is
+     * already registered; the new entry introduces no cycle.
+     *
+     * @param name The single-token registration to replace.
+     * @param entry The internal registry-entry object to install.
+     */
+    rebind(name: Token, entry: RegistryEntry): Promise<void>;
 
     // =======================================================
     //  Testing hooks

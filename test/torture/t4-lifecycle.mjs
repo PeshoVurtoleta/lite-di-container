@@ -17,7 +17,7 @@
  * are gone.
  */
 
-import { Container } from '../../Container.js';
+import { Container, TYPES } from '../../Container.js';
 import { check, retention, validate } from './harness.mjs';
 
 export async function run() {
@@ -284,6 +284,108 @@ export async function run() {
             const r = retention(c);
             check(r.singletons === 0 && r.flags === 0 && r.order === 0,
                 () => 'T4.undef-slot: multi state not released on shutdown');
+        }
+
+        // -- invalidate(): flush + rebuild, has() stays true (decision 0005) --
+        {
+            const c = new Container();
+            let n = 0;
+            class Svc { constructor() { this.id = ++n; } }
+            const torn = [];
+            c.singleton('svc', Svc);
+            c.onTeardown('svc', (inst) => { torn.push(inst.id); });
+            c.boot();
+            const a = c.get('svc');
+            await c.invalidate('svc');
+            check(c.has('svc') === true, () => 'T4.invalidate: has() went false after invalidate()');
+            const b = c.get('svc');
+            check(a.id === 1 && b.id === 2 && a !== b,
+                () => `T4.invalidate: get() did not return a NEW instance (a=${a.id} b=${b.id})`);
+            check(torn.length === 1 && torn[0] === 1,
+                () => `T4.invalidate: the flushed instance did not run its teardown (${JSON.stringify(torn)})`);
+            check(c._resolutionOrder.length === 1 && validate(c),
+                () => `T4.invalidate: resolution order corrupted (len=${c._resolutionOrder.length})`);
+        }
+
+        // -- invalidate() fails closed: non-live / mid-resolution / unknown --
+        {
+            const c = new Container();
+            class Svc {}
+            c.singleton('svc', Svc);
+            c.boot();
+            c.get('svc');
+            await c.shutdown();
+            let nonLive = false;
+            try { await c.invalidate('svc'); } catch (e) { nonLive = /not live/i.test(e.message); }
+            check(nonLive, () => 'T4.invalidate-guard: invalidate() on a shut-down container did not throw');
+
+            const c2 = new Container();
+            c2.boot();
+            let unknown = false;
+            try { await c2.invalidate('ghost'); } catch (e) { unknown = /not registered/i.test(e.message); }
+            check(unknown, () => 'T4.invalidate-guard: invalidate() of an unregistered name did not throw');
+
+            const c3 = new Container();
+            let pending = null;
+            c3.singletonFactory('a', (cc) => { pending = cc.invalidate('a'); return {}; });
+            c3.boot();
+            c3.get('a');
+            let midRes = false;
+            try { await pending; } catch (e) { midRes = /mid-resolution/i.test(e.message); }
+            check(midRes, () => 'T4.invalidate-guard: mid-resolution invalidate() did not throw');
+        }
+
+        // -- rebind(): atomic swap, and untouched-on-failure (decision 0005) --
+        {
+            const c = new Container();
+            class Old { constructor() { this.v = 'old'; } }
+            class New { constructor() { this.v = 'new'; } }
+            c.singleton('svc', Old);
+            c.boot();
+            check(c.get('svc').v === 'old', () => 'T4.rebind: pre-rebind get() wrong');
+            await c.rebind('svc', { type: TYPES.SINGLETON, Class: New, deps: [], isAsync: false, isCached: true });
+            check(c.get('svc').v === 'new', () => 'T4.rebind: get() did not build from the rebound entry');
+            check(c._resolutionOrder.length === 1 && validate(c),
+                () => 'T4.rebind: resolution order corrupted by rebind');
+
+            // A rebind that would introduce a cycle throws, registry UNTOUCHED.
+            const c2 = new Container();
+            class A {} class B {}
+            c2.singleton('a', A, ['b']);
+            c2.singleton('b', B, []);
+            c2.boot();
+            const before = c2._registry.get('b');
+            let cyc = false;
+            try {
+                await c2.rebind('b', { type: TYPES.SINGLETON, Class: B, deps: ['a'], isAsync: false, isCached: true });
+            } catch (e) { cyc = /circular/i.test(e.message); }
+            check(cyc, () => 'T4.rebind: a cycle-introducing rebind did not throw');
+            check(c2._registry.get('b') === before,
+                () => 'T4.rebind: a failed rebind mutated the registry (not atomic)');
+
+            // A rebind with a missing dep throws, registry UNTOUCHED.
+            const c3 = new Container();
+            c3.singleton('svc', Old);
+            c3.boot();
+            const before3 = c3._registry.get('svc');
+            let missing = false;
+            try {
+                await c3.rebind('svc', { type: TYPES.SINGLETON, Class: New, deps: ['nope'], isAsync: false, isCached: true });
+            } catch (e) { missing = /not registered/i.test(e.message); }
+            check(missing, () => 'T4.rebind: a missing-dep rebind did not throw');
+            check(c3._registry.get('svc') === before3,
+                () => 'T4.rebind: a failed missing-dep rebind mutated the registry');
+
+            // A kind change (multi -> single) throws.
+            const c4 = new Container();
+            class P {}
+            c4.multi('m', P);
+            c4.boot();
+            let kind = false;
+            try {
+                await c4.rebind('m', { type: TYPES.SINGLETON, Class: P, deps: [], isAsync: false, isCached: true });
+            } catch (e) { kind = /multi binding/i.test(e.message); }
+            check(kind, () => 'T4.rebind: a kind-change rebind did not throw');
         }
 
         // -- A healthy container still validates after the whole tier --------
