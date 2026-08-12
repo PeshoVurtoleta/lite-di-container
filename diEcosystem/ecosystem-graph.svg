@@ -1,0 +1,90 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 1000" width="1000" height="1000" role="img" aria-label="The lite-di-container at the center of ten capability siblings on a ring: graph, cron, ticker, event-bus, signal, strategies, lock, supervisor, health, and orchestrator.">
+  <defs>
+    <style>
+      .sans { font-family: "Helvetica Neue", Helvetica, Arial, sans-serif; }
+      .mono { font-family: "Menlo", "SF Mono", "Consolas", monospace; }
+    </style>
+  </defs>
+
+  <!-- card -->
+  <rect x="8" y="8" width="984" height="984" rx="24" fill="#FFFFFF" stroke="#D8E0EA" stroke-width="1.5"/>
+
+  <!-- header -->
+  <text class="mono" x="500" y="78" text-anchor="middle" font-size="14" letter-spacing="1.5" fill="#0C8E80">@zakkster/lite-di-*  &#183;  11 PACKAGES  &#183;  0 DEPS  &#183;  0 B/OP</text>
+  <text class="sans" x="500" y="126" text-anchor="middle" font-size="34" font-weight="700" fill="#0F141C">A self-healing service kernel</text>
+  <text class="sans" x="500" y="158" text-anchor="middle" font-size="16" fill="#697687">One DI container. Ten capabilities. Boot to SIGTERM.</text>
+
+  <!-- orbit hint -->
+  <circle cx="500" cy="525" r="210" fill="none" stroke="#E4EAF1" stroke-width="1" stroke-dasharray="2 6"/>
+
+  <!-- spokes -->
+  <g stroke="#C3CEDB" stroke-width="1.4">
+    <line x1="500" y1="525" x2="500" y2="315"/>
+    <line x1="500" y1="525" x2="623.4" y2="355.1"/>
+    <line x1="500" y1="525" x2="699.8" y2="460.1"/>
+    <line x1="500" y1="525" x2="699.8" y2="589.9"/>
+    <line x1="500" y1="525" x2="623.4" y2="694.9"/>
+    <line x1="500" y1="525" x2="500" y2="735"/>
+    <line x1="500" y1="525" x2="376.6" y2="694.9"/>
+    <line x1="500" y1="525" x2="300.2" y2="589.9"/>
+    <line x1="500" y1="525" x2="300.2" y2="460.1"/>
+  </g>
+  <line x1="500" y1="525" x2="376.6" y2="355.1" stroke="#B8600A" stroke-width="1.4" stroke-opacity="0.6" stroke-dasharray="3 3"/>
+
+  <!-- core -->
+  <circle cx="500" cy="525" r="60" fill="#D3EFEA" stroke="#0C8E80" stroke-width="1.9"/>
+  <text class="mono" x="500" y="521" text-anchor="middle" font-size="16" font-weight="700" fill="#075049">container</text>
+  <text class="mono" x="500" y="543" text-anchor="middle" font-size="12" fill="#697687">2.2.0</text>
+
+  <!-- ring chips: x = cx - w/2, y = cy - 15, h = 30 -->
+  <g>
+    <rect x="461" y="300" width="78" height="30" rx="8" fill="#FFFFFF" stroke="#C3CEDB" stroke-width="1.3"/>
+    <text class="mono" x="500" y="319" text-anchor="middle" font-size="13" fill="#0F141C">graph</text>
+  </g>
+  <g>
+    <rect x="587.4" y="340.1" width="72" height="30" rx="8" fill="#FFFFFF" stroke="#C3CEDB" stroke-width="1.3"/>
+    <text class="mono" x="623.4" y="359.1" text-anchor="middle" font-size="13" fill="#0F141C">cron</text>
+  </g>
+  <g>
+    <rect x="657.8" y="445.1" width="84" height="30" rx="8" fill="#FFFFFF" stroke="#C3CEDB" stroke-width="1.3"/>
+    <text class="mono" x="699.8" y="464.1" text-anchor="middle" font-size="13" fill="#0F141C">ticker</text>
+  </g>
+  <g>
+    <rect x="645.8" y="574.9" width="108" height="30" rx="8" fill="#FFFFFF" stroke="#C3CEDB" stroke-width="1.3"/>
+    <text class="mono" x="699.8" y="593.9" text-anchor="middle" font-size="13" fill="#0F141C">event-bus</text>
+  </g>
+  <g>
+    <rect x="581.4" y="679.9" width="84" height="30" rx="8" fill="#FFFFFF" stroke="#C3CEDB" stroke-width="1.3"/>
+    <text class="mono" x="623.4" y="698.9" text-anchor="middle" font-size="13" fill="#0F141C">signal</text>
+  </g>
+  <g>
+    <rect x="442" y="720" width="116" height="30" rx="8" fill="#FFFFFF" stroke="#C3CEDB" stroke-width="1.3"/>
+    <text class="mono" x="500" y="739" text-anchor="middle" font-size="13" fill="#0F141C">strategies</text>
+  </g>
+  <g>
+    <rect x="340.6" y="679.9" width="72" height="30" rx="8" fill="#FFFFFF" stroke="#C3CEDB" stroke-width="1.3"/>
+    <text class="mono" x="376.6" y="698.9" text-anchor="middle" font-size="13" fill="#0F141C">lock</text>
+  </g>
+  <g>
+    <rect x="242.2" y="574.9" width="116" height="30" rx="8" fill="#FFFFFF" stroke="#C3CEDB" stroke-width="1.3"/>
+    <text class="mono" x="300.2" y="593.9" text-anchor="middle" font-size="13" fill="#0F141C">supervisor</text>
+  </g>
+  <g>
+    <rect x="258.2" y="445.1" width="84" height="30" rx="8" fill="#FFFFFF" stroke="#C3CEDB" stroke-width="1.3"/>
+    <text class="mono" x="300.2" y="464.1" text-anchor="middle" font-size="13" fill="#0F141C">health</text>
+  </g>
+  <g>
+    <rect x="310.6" y="340.1" width="132" height="30" rx="8" fill="#F4E2CC" stroke="#B8600A" stroke-width="1.4"/>
+    <text class="mono" x="376.6" y="359.1" text-anchor="middle" font-size="13" font-weight="600" fill="#8A4708">orchestrator</text>
+  </g>
+
+  <!-- legend -->
+  <g class="mono" font-size="14" fill="#697687">
+    <rect x="300" y="915" width="14" height="14" rx="3" fill="#D3EFEA" stroke="#0C8E80" stroke-width="1.3"/>
+    <text x="323" y="927">the kernel</text>
+    <rect x="435" y="915" width="14" height="14" rx="3" fill="#FFFFFF" stroke="#C3CEDB" stroke-width="1.3"/>
+    <text x="458" y="927">capability sibling</text>
+    <rect x="628" y="915" width="14" height="14" rx="3" fill="#F4E2CC" stroke="#B8600A" stroke-width="1.3"/>
+    <text x="651" y="927">shutdown capstone</text>
+  </g>
+</svg>

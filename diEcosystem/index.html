@@ -1,0 +1,1306 @@
+<title>lite-di-* — a self-healing service kernel</title>
+<style>
+    :root {
+        --bg: #F4F6F9;
+        --surface: #FFFFFF;
+        --surface-2: #ECF1F6;
+        --ink: #0F141C;
+        --ink-soft: #414C5B;
+        --muted: #697687;
+        --line: #D8E0EA;
+        --line-strong: #C3CEDB;
+        --accent: #0C8E80;
+        --accent-ink: #075049;
+        --accent-soft: #D3EFEA;
+        --ember: #B8600A;
+        --ember-soft: #F4E2CC;
+        --ok: #1E9D55;
+        --warn: #9C6A12;
+        --crit: #C93A34;
+        --core-glow: rgba(12, 142, 128, 0.16);
+        --shadow: 0 1px 2px rgba(16, 24, 40, .06), 0 8px 24px rgba(16, 24, 40, .06);
+        --font-mono: ui-monospace, "SF Mono", "JetBrains Mono", "Menlo", "Consolas", monospace;
+        --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "Roboto", "Helvetica Neue", Arial, sans-serif;
+        --maxw: 1080px;
+    }
+
+    @media (prefers-color-scheme: dark) {
+        :root {
+            --bg: #090C12;
+            --surface: #10151E;
+            --surface-2: #161D29;
+            --ink: #E7ECF4;
+            --ink-soft: #AEB9C8;
+            --muted: #7A879A;
+            --line: #1F2836;
+            --line-strong: #2C3849;
+            --accent: #4EE7D2;
+            --accent-ink: #4EE7D2;
+            --accent-soft: #10312D;
+            --ember: #F5A623;
+            --ember-soft: #33260F;
+            --ok: #3FB950;
+            --warn: #D29922;
+            --crit: #F85149;
+            --core-glow: rgba(78, 231, 210, 0.18);
+            --shadow: 0 1px 2px rgba(0, 0, 0, .4), 0 10px 30px rgba(0, 0, 0, .35);
+        }
+    }
+
+    :root[data-theme="light"] {
+        --bg: #F4F6F9;
+        --surface: #FFFFFF;
+        --surface-2: #ECF1F6;
+        --ink: #0F141C;
+        --ink-soft: #414C5B;
+        --muted: #697687;
+        --line: #D8E0EA;
+        --line-strong: #C3CEDB;
+        --accent: #0C8E80;
+        --accent-ink: #075049;
+        --accent-soft: #D3EFEA;
+        --ember: #B8600A;
+        --ember-soft: #F4E2CC;
+        --ok: #1E9D55;
+        --warn: #9C6A12;
+        --crit: #C93A34;
+        --core-glow: rgba(12, 142, 128, 0.16);
+        --shadow: 0 1px 2px rgba(16, 24, 40, .06), 0 8px 24px rgba(16, 24, 40, .06);
+    }
+
+    :root[data-theme="dark"] {
+        --bg: #090C12;
+        --surface: #10151E;
+        --surface-2: #161D29;
+        --ink: #E7ECF4;
+        --ink-soft: #AEB9C8;
+        --muted: #7A879A;
+        --line: #1F2836;
+        --line-strong: #2C3849;
+        --accent: #4EE7D2;
+        --accent-ink: #4EE7D2;
+        --accent-soft: #10312D;
+        --ember: #F5A623;
+        --ember-soft: #33260F;
+        --ok: #3FB950;
+        --warn: #D29922;
+        --crit: #F85149;
+        --core-glow: rgba(78, 231, 210, 0.18);
+        --shadow: 0 1px 2px rgba(0, 0, 0, .4), 0 10px 30px rgba(0, 0, 0, .35);
+    }
+
+    * {
+        box-sizing: border-box;
+    }
+
+    html {
+        -webkit-text-size-adjust: 100%;
+    }
+
+    body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--ink);
+        font-family: var(--font-sans);
+        font-size: 16px;
+        line-height: 1.6;
+        -webkit-font-smoothing: antialiased;
+        text-rendering: optimizeLegibility;
+    }
+
+    .wrap {
+        max-width: var(--maxw);
+        margin: 0 auto;
+        padding: 0 24px;
+    }
+
+    section {
+        padding: clamp(48px, 8vw, 96px) 0;
+        border-top: 1px solid var(--line);
+    }
+
+    section:first-of-type {
+        border-top: 0;
+    }
+
+    .eyebrow {
+        font-family: var(--font-mono);
+        font-size: .75rem;
+        letter-spacing: .16em;
+        text-transform: uppercase;
+        color: var(--accent-ink);
+        margin: 0 0 18px;
+        display: flex;
+        align-items: center;
+        gap: 10px;
+    }
+
+    .eyebrow::before {
+        content: "";
+        width: 22px;
+        height: 1px;
+        background: var(--accent);
+        opacity: .8;
+    }
+
+    h1, h2, h3 {
+        text-wrap: balance;
+    }
+
+    h2 {
+        font-size: clamp(1.6rem, 3.2vw, 2.3rem);
+        line-height: 1.12;
+        letter-spacing: -0.02em;
+        font-weight: 680;
+        margin: 0 0 16px;
+    }
+
+    h2 .q {
+        color: var(--muted);
+        font-weight: 680;
+    }
+
+    .lede {
+        font-size: clamp(1.02rem, 1.6vw, 1.18rem);
+        color: var(--ink-soft);
+        max-width: 62ch;
+        margin: 0;
+    }
+
+    p {
+        margin: 0 0 1em;
+    }
+
+    code, .mono {
+        font-family: var(--font-mono);
+    }
+
+    /* ---------- HERO ---------- */
+    .hero {
+        position: relative;
+        overflow: hidden;
+        padding-top: clamp(56px, 9vw, 104px);
+        padding-bottom: clamp(48px, 7vw, 80px);
+    }
+
+    #trace {
+        position: absolute;
+        inset: auto 0 0 0;
+        width: 100%;
+        height: 190px;
+        opacity: .5;
+        pointer-events: none;
+        z-index: 0;
+    }
+
+    .hero .wrap {
+        position: relative;
+        z-index: 1;
+    }
+
+    .hero-kicker {
+        font-family: var(--font-mono);
+        font-size: .8rem;
+        letter-spacing: .06em;
+        color: var(--muted);
+        margin: 0 0 22px;
+    }
+
+    .hero-kicker b {
+        color: var(--accent-ink);
+        font-weight: 600;
+    }
+
+    .hero h1 {
+        font-size: clamp(2.1rem, 6vw, 4rem);
+        line-height: 1.03;
+        letter-spacing: -0.035em;
+        font-weight: 720;
+        margin: 0 0 22px;
+        max-width: 17ch;
+    }
+
+    .hero h1 em {
+        font-style: normal;
+        color: var(--accent-ink);
+    }
+
+    .hero-sub {
+        font-size: clamp(1.05rem, 1.8vw, 1.28rem);
+        color: var(--ink-soft);
+        max-width: 60ch;
+        margin: 0 0 34px;
+    }
+
+    .metrics {
+        display: grid;
+        grid-template-columns: repeat(5, minmax(0, 1fr));
+        gap: 1px;
+        background: var(--line);
+        border: 1px solid var(--line);
+        border-radius: 12px;
+        overflow: hidden;
+        box-shadow: var(--shadow);
+    }
+
+    .metric {
+        background: var(--surface);
+        padding: 18px 16px;
+    }
+
+    .metric .n {
+        font-family: var(--font-mono);
+        font-size: clamp(1.2rem, 2.4vw, 1.75rem);
+        font-weight: 600;
+        letter-spacing: -0.02em;
+        color: var(--ink);
+        font-variant-numeric: tabular-nums;
+        line-height: 1;
+    }
+
+    .metric .n .u {
+        color: var(--accent-ink);
+    }
+
+    .metric .l {
+        font-family: var(--font-mono);
+        font-size: .68rem;
+        letter-spacing: .1em;
+        text-transform: uppercase;
+        color: var(--muted);
+        margin-top: 9px;
+    }
+
+    @media (max-width: 720px) {
+        .metrics {
+            grid-template-columns: repeat(2, 1fr);
+        }
+
+        .metric:last-child {
+            grid-column: 1 / -1;
+        }
+    }
+
+    /* ---------- KERNEL DIAGRAM ---------- */
+    .kernel-grid {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: clamp(28px, 5vw, 60px);
+        align-items: center;
+    }
+
+    @media (max-width: 860px) {
+        .kernel-grid {
+            grid-template-columns: 1fr;
+        }
+    }
+
+    .diagram-shell {
+        background: radial-gradient(circle at 50% 46%, var(--core-glow), transparent 62%);
+        border: 1px solid var(--line);
+        border-radius: 16px;
+        padding: 12px;
+    }
+
+    svg.kernel {
+        width: 100%;
+        height: auto;
+        display: block;
+        overflow: visible;
+    }
+
+    .kline {
+        stroke: var(--line-strong);
+        stroke-width: 1.2;
+    }
+
+    .kline.cap {
+        stroke: var(--ember);
+        stroke-opacity: .55;
+        stroke-dasharray: 3 3;
+    }
+
+    .chip-box {
+        fill: var(--surface);
+        stroke: var(--line-strong);
+        stroke-width: 1.2;
+    }
+
+    .chip-box.cap {
+        stroke: var(--ember);
+    }
+
+    .chip-t {
+        fill: var(--ink);
+        font-family: var(--font-mono);
+        font-size: 13px;
+        font-weight: 500;
+    }
+
+    .chip-t.cap {
+        fill: var(--ember);
+    }
+
+    .core-ring {
+        fill: var(--surface);
+        stroke: var(--accent);
+        stroke-width: 1.6;
+    }
+
+    .core-t {
+        fill: var(--accent-ink);
+        font-family: var(--font-mono);
+        font-weight: 600;
+    }
+
+    .core-v {
+        fill: var(--muted);
+        font-family: var(--font-mono);
+    }
+
+    .legend {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 16px;
+        margin-top: 20px;
+        font-family: var(--font-mono);
+        font-size: .74rem;
+        color: var(--muted);
+    }
+
+    .legend span {
+        display: inline-flex;
+        align-items: center;
+        gap: 7px;
+    }
+
+    .swatch {
+        width: 12px;
+        height: 12px;
+        border-radius: 3px;
+        border: 1px solid var(--line-strong);
+    }
+
+    .swatch.core {
+        border-color: var(--accent);
+        background: var(--accent-soft);
+    }
+
+    .swatch.cap {
+        border-color: var(--ember);
+        background: var(--ember-soft);
+    }
+
+    .kernel-copy h2 {
+        margin-bottom: 18px;
+    }
+
+    .kernel-copy p {
+        color: var(--ink-soft);
+        max-width: 46ch;
+    }
+
+    .pull {
+        border-left: 2px solid var(--accent);
+        padding-left: 16px;
+        margin: 24px 0 0;
+        font-size: 1.02rem;
+        color: var(--ink);
+    }
+
+    .pull b {
+        color: var(--accent-ink);
+    }
+
+    /* ---------- LIFECYCLE RAIL ---------- */
+    .rail {
+        display: grid;
+        grid-template-columns: repeat(5, 1fr);
+        gap: 1px;
+        background: var(--line);
+        border: 1px solid var(--line);
+        border-radius: 14px;
+        overflow: hidden;
+    }
+
+    @media (max-width: 900px) {
+        .rail {
+            grid-template-columns: 1fr 1fr;
+        }
+    }
+
+    @media (max-width: 520px) {
+        .rail {
+            grid-template-columns: 1fr;
+        }
+    }
+
+    .phase {
+        background: var(--surface);
+        padding: 22px 20px;
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+    }
+
+    .phase .idx {
+        font-family: var(--font-mono);
+        font-size: .72rem;
+        letter-spacing: .12em;
+        color: var(--accent-ink);
+    }
+
+    .phase .pname {
+        font-weight: 660;
+        font-size: 1.06rem;
+        letter-spacing: -0.01em;
+    }
+
+    .phase .pdesc {
+        font-size: .9rem;
+        color: var(--ink-soft);
+        line-height: 1.5;
+        margin: 0;
+    }
+
+    .phase .pkgs {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+        margin-top: auto;
+    }
+
+    .tag {
+        font-family: var(--font-mono);
+        font-size: .72rem;
+        padding: 3px 8px;
+        border-radius: 6px;
+        background: var(--surface-2);
+        color: var(--ink-soft);
+        border: 1px solid var(--line);
+    }
+
+    .tag.cap {
+        color: var(--ember);
+        border-color: var(--ember);
+        background: var(--ember-soft);
+    }
+
+    /* ---------- PACKAGE CARDS ---------- */
+    .cards {
+        display: grid;
+        grid-template-columns: repeat(2, 1fr);
+        gap: 14px;
+    }
+
+    @media (max-width: 720px) {
+        .cards {
+            grid-template-columns: 1fr;
+        }
+    }
+
+    .card {
+        background: var(--surface);
+        border: 1px solid var(--line);
+        border-radius: 12px;
+        padding: 20px;
+        box-shadow: var(--shadow);
+        transition: border-color .18s ease, transform .18s ease;
+    }
+
+    .card:hover {
+        border-color: var(--accent);
+        transform: translateY(-2px);
+    }
+
+    .card.core {
+        border-color: var(--line-strong);
+        background: linear-gradient(180deg, var(--accent-soft), var(--surface) 70%);
+    }
+
+    .card-head {
+        display: flex;
+        align-items: baseline;
+        justify-content: space-between;
+        gap: 12px;
+        margin-bottom: 10px;
+    }
+
+    .card-id {
+        font-family: var(--font-mono);
+        font-weight: 600;
+        font-size: 1rem;
+        color: var(--ink);
+    }
+
+    .card-id .scope {
+        color: var(--muted);
+        font-weight: 400;
+    }
+
+    .ver {
+        font-family: var(--font-mono);
+        font-size: .74rem;
+        padding: 2px 8px;
+        border-radius: 20px;
+        background: var(--surface-2);
+        color: var(--ink-soft);
+        border: 1px solid var(--line);
+        white-space: nowrap;
+    }
+
+    .card.core .ver {
+        background: var(--surface);
+    }
+
+    .card-role {
+        font-family: var(--font-mono);
+        font-size: .7rem;
+        letter-spacing: .08em;
+        text-transform: uppercase;
+        color: var(--accent-ink);
+        margin-bottom: 8px;
+    }
+
+    .card p {
+        font-size: .92rem;
+        color: var(--ink-soft);
+        margin: 0 0 14px;
+        line-height: 1.5;
+    }
+
+    .proves {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        font-family: var(--font-mono);
+        font-size: .74rem;
+        color: var(--muted);
+        border-top: 1px dashed var(--line-strong);
+        padding-top: 12px;
+    }
+
+    .proves b {
+        color: var(--ink);
+        font-weight: 600;
+    }
+
+    .proves .dot {
+        width: 6px;
+        height: 6px;
+        border-radius: 50%;
+        background: var(--ok);
+        flex: none;
+    }
+
+    /* ---------- LAWS ---------- */
+    .laws {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 1px;
+        background: var(--line);
+        border: 1px solid var(--line);
+        border-radius: 14px;
+        overflow: hidden;
+    }
+
+    @media (max-width: 820px) {
+        .laws {
+            grid-template-columns: 1fr;
+        }
+    }
+
+    .law {
+        background: var(--surface);
+        padding: 24px 22px;
+    }
+
+    .law .lk {
+        font-family: var(--font-mono);
+        font-size: .78rem;
+        color: var(--accent-ink);
+        letter-spacing: .04em;
+        margin-bottom: 10px;
+    }
+
+    .law .lt {
+        font-weight: 640;
+        font-size: 1.04rem;
+        margin-bottom: 8px;
+        letter-spacing: -0.01em;
+    }
+
+    .law p {
+        font-size: .9rem;
+        color: var(--ink-soft);
+        margin: 0;
+        line-height: 1.55;
+    }
+
+    .law p .m {
+        font-family: var(--font-mono);
+        color: var(--ink);
+        font-size: .84rem;
+    }
+
+    /* ---------- COMPOSED PROOF ---------- */
+    .proof-grid {
+        display: flex;
+        flex-direction: column;
+        gap: clamp(24px, 4vw, 44px);
+    }
+
+    pre.code {
+        margin: 0;
+        background: var(--surface);
+        border: 1px solid var(--line);
+        border-radius: 12px;
+        padding: 20px;
+        overflow-x: auto;
+        font-family: var(--font-mono);
+        font-size: .82rem;
+        line-height: 1.7;
+        color: var(--ink-soft);
+        box-shadow: var(--shadow);
+    }
+
+    pre.code .c {
+        color: var(--muted);
+    }
+
+    pre.code .k {
+        color: var(--accent-ink);
+    }
+
+    pre.code .e {
+        color: var(--ember);
+    }
+
+    pre.code .s {
+        color: var(--ink);
+    }
+
+    .proof-copy h2 {
+        margin-bottom: 16px;
+    }
+
+    .proof-copy p {
+        color: var(--ink-soft);
+    }
+
+    .order {
+        font-family: var(--font-mono);
+        font-size: .8rem;
+        line-height: 1.9;
+        color: var(--ink);
+        background: var(--surface-2);
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        padding: 16px 18px;
+        margin-top: 20px;
+        overflow-x: auto;
+        white-space: nowrap;
+    }
+
+    .order .arw {
+        color: var(--accent-ink);
+    }
+
+    .order .ok {
+        color: var(--ok);
+    }
+
+    /* ---------- FOOTER ---------- */
+    footer {
+        border-top: 1px solid var(--line);
+        padding: 48px 0 64px;
+    }
+
+    .foot-grid {
+        display: flex;
+        flex-wrap: wrap;
+        justify-content: space-between;
+        gap: 24px;
+        align-items: flex-start;
+    }
+
+    .foot-note {
+        font-size: .9rem;
+        color: var(--ink-soft);
+        max-width: 52ch;
+    }
+
+    .foot-note b {
+        color: var(--ink);
+    }
+
+    .foot-meta {
+        font-family: var(--font-mono);
+        font-size: .78rem;
+        color: var(--muted);
+        line-height: 1.8;
+    }
+
+    .foot-meta a {
+        color: var(--accent-ink);
+        text-decoration: none;
+    }
+
+    .status-pill {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        font-family: var(--font-mono);
+        font-size: .72rem;
+        padding: 3px 9px;
+        border-radius: 20px;
+        border: 1px solid var(--line-strong);
+        color: var(--ink-soft);
+    }
+
+    .status-pill .d {
+        width: 7px;
+        height: 7px;
+        border-radius: 50%;
+    }
+
+    .d.ok {
+        background: var(--ok);
+    }
+
+    .d.warn {
+        background: var(--warn);
+    }
+
+    .d.crit {
+        background: var(--crit);
+    }
+
+    .reveal {
+        opacity: 0;
+        transform: translateY(14px);
+        transition: opacity .6s ease, transform .6s ease;
+    }
+
+    .reveal.in {
+        opacity: 1;
+        transform: none;
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+        .reveal {
+            opacity: 1;
+            transform: none;
+            transition: none;
+        }
+
+        .card:hover {
+            transform: none;
+        }
+    }
+
+    a:focus-visible, .card:focus-visible {
+        outline: 2px solid var(--accent);
+        outline-offset: 3px;
+    }
+</style>
+
+<div class="hero">
+    <canvas id="trace" aria-hidden="true"></canvas>
+    <div class="wrap">
+        <p class="hero-kicker"><b>@zakkster/lite-di-*</b> &nbsp;·&nbsp; 11 packages &nbsp;·&nbsp; one runtime</p>
+        <h1>The DI container that grew into a <em>self-healing service kernel</em>.</h1>
+        <p class="hero-sub">A container wires your object graph. These ten siblings turn that graph into a complete
+            backend runtime &mdash; schedule, dispatch, route, lock, supervise, heal, drain, exit &mdash; with zero
+            runtime dependencies and zero allocation on every hot path.</p>
+        <div class="metrics">
+            <div class="metric">
+                <div class="n">11</div>
+                <div class="l">packages</div>
+            </div>
+            <div class="metric">
+                <div class="n">0<span class="u"> deps</span></div>
+                <div class="l">runtime, each</div>
+            </div>
+            <div class="metric">
+                <div class="n">0<span class="u"> B/op</span></div>
+                <div class="l">hot paths</div>
+            </div>
+            <div class="metric">
+                <div class="n">1,000<span class="u">+</span></div>
+                <div class="l">boundary tests</div>
+            </div>
+            <div class="metric">
+                <div class="n">100<span class="u">%</span></div>
+                <div class="l">gates green</div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<section>
+    <div class="wrap">
+        <div class="kernel-grid">
+            <div class="diagram-shell reveal">
+                <svg class="kernel" viewBox="0 0 600 600" role="img"
+                     aria-label="The lite-di-container at the center of ten capability siblings arranged on a ring: graph, cron, ticker, event-bus, signal, strategies, lock, supervisor, health, and orchestrator.">
+                    <!-- spokes -->
+                    <line class="kline" x1="300" y1="300" x2="300" y2="90"/>
+                    <line class="kline" x1="300" y1="300" x2="423" y2="130"/>
+                    <line class="kline" x1="300" y1="300" x2="500" y2="235"/>
+                    <line class="kline" x1="300" y1="300" x2="500" y2="365"/>
+                    <line class="kline" x1="300" y1="300" x2="423" y2="470"/>
+                    <line class="kline" x1="300" y1="300" x2="300" y2="510"/>
+                    <line class="kline" x1="300" y1="300" x2="177" y2="470"/>
+                    <line class="kline" x1="300" y1="300" x2="100" y2="365"/>
+                    <line class="kline" x1="300" y1="300" x2="100" y2="235"/>
+                    <line class="kline cap" x1="300" y1="300" x2="177" y2="130"/>
+
+                    <!-- core -->
+                    <circle class="core-ring" cx="300" cy="300" r="56"/>
+                    <text class="core-t" x="300" y="296" text-anchor="middle" font-size="15">container</text>
+                    <text class="core-v" x="300" y="316" text-anchor="middle" font-size="12">2.2.0</text>
+
+                    <!-- chips: x=cx-w/2, y=cy-15, h=30 -->
+                    <g>
+                        <rect class="chip-box" x="261" y="75" width="78" height="30" rx="8"/>
+                        <text class="chip-t" x="300" y="94" text-anchor="middle">graph</text>
+                    </g>
+                    <g>
+                        <rect class="chip-box" x="387" y="115" width="72" height="30" rx="8"/>
+                        <text class="chip-t" x="423" y="134" text-anchor="middle">cron</text>
+                    </g>
+                    <g>
+                        <rect class="chip-box" x="458" y="220" width="84" height="30" rx="8"/>
+                        <text class="chip-t" x="500" y="239" text-anchor="middle">ticker</text>
+                    </g>
+                    <g>
+                        <rect class="chip-box" x="446" y="350" width="108" height="30" rx="8"/>
+                        <text class="chip-t" x="500" y="369" text-anchor="middle">event-bus</text>
+                    </g>
+                    <g>
+                        <rect class="chip-box" x="381" y="455" width="84" height="30" rx="8"/>
+                        <text class="chip-t" x="423" y="474" text-anchor="middle">signal</text>
+                    </g>
+                    <g>
+                        <rect class="chip-box" x="242" y="495" width="116" height="30" rx="8"/>
+                        <text class="chip-t" x="300" y="514" text-anchor="middle">strategies</text>
+                    </g>
+                    <g>
+                        <rect class="chip-box" x="141" y="455" width="72" height="30" rx="8"/>
+                        <text class="chip-t" x="177" y="474" text-anchor="middle">lock</text>
+                    </g>
+                    <g>
+                        <rect class="chip-box" x="42" y="350" width="116" height="30" rx="8"/>
+                        <text class="chip-t" x="100" y="369" text-anchor="middle">supervisor</text>
+                    </g>
+                    <g>
+                        <rect class="chip-box" x="58" y="220" width="84" height="30" rx="8"/>
+                        <text class="chip-t" x="100" y="239" text-anchor="middle">health</text>
+                    </g>
+                    <g>
+                        <rect class="chip-box cap" x="111" y="115" width="132" height="30" rx="8"/>
+                        <text class="chip-t cap" x="177" y="134" text-anchor="middle">orchestrator</text>
+                    </g>
+                </svg>
+                <div class="legend">
+                    <span><i class="swatch core"></i> the kernel</span>
+                    <span><i class="swatch"></i> capability sibling</span>
+                    <span><i class="swatch cap"></i> shutdown capstone</span>
+                </div>
+            </div>
+            <div class="kernel-copy reveal">
+                <p class="eyebrow">The thesis</p>
+                <h2>One core. Everything else is a binding.</h2>
+                <p>Every capability is built <em>on</em> the container, not beside it: its units are
+                    container-constructed classes with injected dependencies, cached at boot, and torn down in
+                    reverse-topological order. No sibling reaches into another's internals &mdash; they compose through
+                    the graph.</p>
+                <p class="pull">The container shipped <b>invalidate / rebind</b> at 2.2.0 &mdash; post-boot hot-swap.
+                    That single hinge is what lets the supervisor rebuild a faulted subtree in place. <b>Rebind is the
+                        hinge; the orchestrator is the capstone.</b></p>
+            </div>
+        </div>
+    </div>
+</section>
+
+<section>
+    <div class="wrap">
+        <p class="eyebrow reveal">One service lifecycle</p>
+        <h2 class="reveal">From boot to SIGTERM, in order.</h2>
+        <p class="lede reveal" style="margin-bottom:34px;">The siblings aren't a grab-bag &mdash; they map onto the
+            ordered life of one long-running service. That order is real: teardown runs it in reverse.</p>
+        <div class="rail reveal">
+            <div class="phase">
+                <span class="idx">01 · BUILD</span>
+                <span class="pname">Wire &amp; inspect</span>
+                <p class="pdesc">Register the graph, validate it at boot, export a snapshot to see it.</p>
+                <div class="pkgs"><span class="tag">container</span><span class="tag">graph</span></div>
+            </div>
+            <div class="phase">
+                <span class="idx">02 · RUN</span>
+                <span class="pname">Drive over time</span>
+                <p class="pdesc">Clocks, frames, events, and reactive state &mdash; all firing at 0 B/op.</p>
+                <div class="pkgs"><span class="tag">cron</span><span class="tag">ticker</span><span class="tag">event-bus</span><span
+                        class="tag">signal</span></div>
+            </div>
+            <div class="phase">
+                <span class="idx">03 · COORDINATE</span>
+                <span class="pname">Route &amp; guard</span>
+                <p class="pdesc">Pick a handler by input; hold a leader-only lease with a fencing token.</p>
+                <div class="pkgs"><span class="tag">strategies</span><span class="tag">lock</span></div>
+            </div>
+            <div class="phase">
+                <span class="idx">04 · HEAL</span>
+                <span class="pname">Supervise &amp; observe</span>
+                <p class="pdesc">Restart faulted subtrees; aggregate readiness &amp; liveness into a verdict.</p>
+                <div class="pkgs"><span class="tag">supervisor</span><span class="tag">health</span></div>
+            </div>
+            <div class="phase">
+                <span class="idx">05 · EXIT</span>
+                <span class="pname">Drain &amp; stop</span>
+                <p class="pdesc">Catch SIGTERM, bleed traffic, run steps, dismantle the graph, exit once.</p>
+                <div class="pkgs"><span class="tag cap">orchestrator</span></div>
+            </div>
+        </div>
+    </div>
+</section>
+
+<section>
+    <div class="wrap">
+        <p class="eyebrow reveal">The eleven</p>
+        <h2 class="reveal">Each earns its place by one falsifiable proof.</h2>
+        <p class="lede reveal" style="margin-bottom:34px;">The suite law: a symbol ships only if a torture tier can
+            falsify it. Here's the one thing each package puts on the line &mdash; and the boundary suite that holds
+            it.</p>
+        <div class="cards">
+
+            <div class="card core reveal">
+                <div class="card-head"><span class="card-id"><span class="scope">lite-di-</span>container</span><span
+                        class="ver">2.2.0 · stable</span></div>
+                <div class="card-role">the kernel</div>
+                <p>Explicit registration, boot-time graph validation, reverse-topological teardown,
+                    <code>describe()</code> introspection, and post-boot <code>invalidate</code>/<code>rebind</code>
+                    hot-swap.</p>
+                <div class="proves"><i class="dot"></i>proves <b>rebind swaps a booted node</b> &nbsp;·&nbsp; 39 tests +
+                    torture
+                </div>
+            </div>
+
+            <div class="card reveal">
+                <div class="card-head"><span class="card-id"><span class="scope">lite-di-</span>event-bus</span><span
+                        class="ver">1.1.0 · stable</span></div>
+                <div class="card-role">run · dispatch</div>
+                <p>Zero-alloc event fan-out over a boot-locked <code>multi</code> topology; DI-constructed listeners,
+                    fail-closed after shutdown, plus an opt-in flight recorder (record / replay).</p>
+                <div class="proves"><i class="dot"></i>proves <b>0 B/emit &amp; replay in order</b> &nbsp;·&nbsp; 88
+                    tests
+                </div>
+            </div>
+
+            <div class="card reveal">
+                <div class="card-head"><span class="card-id"><span class="scope">lite-di-</span>cron</span><span
+                        class="ver">1.0.0 · stable</span></div>
+                <div class="card-role">run · schedule</div>
+                <p>Wall-clock cron / interval scheduler over a DI topology. DI-constructed jobs, a 0 B/tick synchronous
+                    path, one job per id.</p>
+                <div class="proves"><i class="dot"></i>proves <b>0 B/tick, single-job-per-id</b> &nbsp;·&nbsp; 70 tests
+                </div>
+            </div>
+
+            <div class="card reveal">
+                <div class="card-head"><span class="card-id"><span class="scope">lite-di-</span>ticker</span><span
+                        class="ver">1.0.0 · stable</span></div>
+                <div class="card-role">run · frames</div>
+                <p>Frame-lane rAF system ticker over a DI topology. DI-constructed systems in pre / normal / post lanes,
+                    0 B/frame on the sync tick.</p>
+                <div class="proves"><i class="dot"></i>proves <b>0 B/frame, lane order</b> &nbsp;·&nbsp; 54 tests</div>
+            </div>
+
+            <div class="card reveal">
+                <div class="card-head"><span class="card-id"><span class="scope">lite-di-</span>signal</span><span
+                        class="ver">1.0.0 · stable</span></div>
+                <div class="card-role">run · reactive</div>
+                <p>Fail-closed reactive bridge: each container scope gets an isolated signal registry wired into
+                    reverse-topo teardown; declarative signal / computed / effect bindings, duck-typed deps.</p>
+                <div class="proves"><i class="dot"></i>proves <b>scope registry dies last</b> &nbsp;·&nbsp; 54 tests
+                </div>
+            </div>
+
+            <div class="card reveal">
+                <div class="card-head"><span class="card-id"><span class="scope">lite-di-</span>strategies</span><span
+                        class="ver">1.0.0 · stable</span></div>
+                <div class="card-role">coordinate · route</div>
+                <p>Read-path strategy router over a booted container. A gate maps input &rarr; key &rarr; frozen token;
+                    <code>select()</code> / <code>resolve()</code> are 0 B/op and fail closed.</p>
+                <div class="proves"><i class="dot"></i>proves <b>0 B/op select, fail-closed</b> &nbsp;·&nbsp; 136 tests
+                </div>
+            </div>
+
+            <div class="card reveal">
+                <div class="card-head"><span class="card-id"><span class="scope">lite-di-</span>lock</span><span
+                        class="ver">1.0.0 · stable</span></div>
+                <div class="card-role">coordinate · mutex</div>
+                <p>DI-scoped lock lifecycle over a pluggable store. Positive-whitelist acquire, a fail-closed fencing
+                    token in a child scope, RAII <code>run(fn)</code>, a heartbeat lease that fails to LOST.</p>
+                <div class="proves"><i class="dot"></i>proves <b>fence is monotonic, fails LOST</b> &nbsp;·&nbsp; 164
+                    tests
+                </div>
+            </div>
+
+            <div class="card reveal">
+                <div class="card-head"><span class="card-id"><span class="scope">lite-di-</span>supervisor</span><span
+                        class="ver">1.0.0 · stable</span></div>
+                <div class="card-role">heal · restart</div>
+                <p>OTP-style supervision tree over a DI topology. one-for-one / all / rest-for-one strategies, a
+                    restart-intensity budget that escalates, 0 B/poll <code>check()</code>, fail-closed pushed faults.
+                </p>
+                <div class="proves"><i class="dot"></i>proves <b>self-heal, budget escalates</b> &nbsp;·&nbsp; 103 tests
+                </div>
+            </div>
+
+            <div class="card reveal">
+                <div class="card-head"><span class="card-id"><span class="scope">lite-di-</span>health</span><span
+                        class="ver">1.0.0 · stable</span></div>
+                <div class="card-role">heal · observe</div>
+                <p>Fail-closed readiness / liveness aggregator. Pull probes and <code>watchSupervisor(check())</code>
+                    collapse to a number verdict; 0 B/op <code>readyz()</code> / <code>livez()</code>; a
+                    <code>drain()</code> latch; an empty lane fails closed.</p>
+                <div class="proves"><i class="dot"></i>proves <b>empty lane = not-ready</b> &nbsp;·&nbsp; 126 tests
+                </div>
+            </div>
+
+            <div class="card reveal">
+                <div class="card-head"><span class="card-id"><span class="scope">lite-di-</span>orchestrator</span><span
+                        class="ver">1.0.0 · stable</span></div>
+                <div class="card-role">exit · capstone</div>
+                <p>Graceful-shutdown lifecycle capstone: SIGTERM &rarr; drain &rarr; supervisor.shutdown &rarr; steps
+                    &rarr; container.shutdown under a hard deadline; <code>exit(code)</code> exactly once (OK / DIRTY /
+                    DEADLINE / FORCED).</p>
+                <div class="proves"><i class="dot"></i>proves <b>ordered drain, exit once</b> &nbsp;·&nbsp; 113 tests
+                </div>
+            </div>
+
+            <div class="card reveal">
+                <div class="card-head"><span class="card-id"><span class="scope">lite-di-</span>graph</span><span
+                        class="ver">1.0.0 · stable</span></div>
+                <div class="card-role">build · inspect</div>
+                <p>Read-only JSON / Graphviz-DOT / Chrome-Trace exporters over a container <code>describe()</code>
+                    snapshot. Pure and fail-closed &mdash; it observes the graph, never mutates it.</p>
+                <div class="proves"><i class="dot"></i>proves <b>pure export, no dangling edge</b> &nbsp;·&nbsp; 53
+                    tests
+                </div>
+            </div>
+
+            <div class="card reveal" style="display:flex;flex-direction:column;justify-content:center;">
+                <div class="card-role" style="margin-bottom:6px;">the option, deferred</div>
+                <div class="card-head"><span class="card-id"><span class="scope">lite-di-</span>signal <span
+                        style="color:var(--muted);font-weight:400;">1.1.0</span></span><span class="ver">planned</span>
+                </div>
+                <p style="margin-bottom:0;">Reactive fan-in &mdash; <code>multiSignal</code> /
+                    <code>multiComputed</code> / <code>multiEffect</code>. Fully planned, staged, and torture-drafted;
+                    held as a documented option, not a gap. The kernel is complete without it.</p>
+            </div>
+
+        </div>
+    </div>
+</section>
+
+<section>
+    <div class="wrap">
+        <p class="eyebrow reveal">Why it reads as one product</p>
+        <h2 class="reveal">Eleven packages, one set of laws.</h2>
+        <div class="laws reveal" style="margin-top:28px;">
+            <div class="law">
+                <div class="lk">law · dependencies</div>
+                <div class="lt">Zero runtime deps</div>
+                <p>Every package ships single-file ESM, <span class="m">node:test</span> only, <span class="m">sideEffects: false</span>.
+                    The container is a peer, never bundled.</p>
+            </div>
+            <div class="law">
+                <div class="lk">law · allocation</div>
+                <div class="lt">Zero-GC hot paths</div>
+                <p>Every dispatch, tick, emit, and select measures <span class="m">0.000 B/op</span> &mdash; hard-gated
+                    over a million ops, <span class="m">gc major = 0</span>.</p>
+            </div>
+            <div class="law">
+                <div class="lk">law · failure</div>
+                <div class="lt">Fail closed, always</div>
+                <p>Every unverified state throws with a named cause. An empty lane is not-ready; a lost lease is LOST.
+                    <span class="m">null is not zero.</span></p>
+            </div>
+            <div class="law">
+                <div class="lk">law · shape</div>
+                <div class="lt">DI-native units</div>
+                <p>Handlers, jobs, systems, listeners &mdash; all container-constructed classes with injected deps, torn
+                    down in reverse-topological order.</p>
+            </div>
+            <div class="law">
+                <div class="lk">law · proof</div>
+                <div class="lt">Torture or it didn't ship</div>
+                <p>Proven by <span class="m">node --expose-gc test/torture.mjs</span> (lite-leak + lite-gc-profiler). No
+                    gate output is a FAIL.</p>
+            </div>
+            <div class="law">
+                <div class="lk">law · surface</div>
+                <div class="lt">Frozen, then additive</div>
+                <p>Each 1.0.0 froze an exact export set. Growth is additive minors &mdash; event-bus 1.1.0 added
+                    record/replay with the nine originals byte-identical.</p>
+            </div>
+        </div>
+    </div>
+</section>
+
+<section>
+    <div class="wrap">
+        <div class="proof-grid">
+            <div class="proof-copy reveal">
+                <p class="eyebrow">Not a diagram &mdash; a running proof</p>
+                <h2>The whole lifecycle, asserted.</h2>
+                <p>lock, health, supervisor and orchestrator can't be proven in isolation &mdash; their reason for being
+                    <em>is</em> the ordered, fail-closed life of one service. So the suite ships <code>service-kernel.mjs</code>:
+                    a runnable reference app that boots the graph, holds a fencing lease, takes a fault and self-heals,
+                    exhausts a restart budget, then catches SIGTERM and drains in the right order.</p>
+                <p>Every claim is checked with <code>node:assert/strict</code>, and
+                    <code>npm&nbsp;run&nbsp;example</code> is a hard prepublish gate. A broken contract exits non-zero.
+                </p>
+                <div class="order reveal">
+                    <span class="c" style="color:var(--muted)">// asserted teardown order on SIGTERM</span><br>
+                    drain <span class="arw">&rarr;</span> supervisor.shutdown <span class="arw">&rarr;</span> steps
+                    <span class="arw">&rarr;</span> container <span class="arw">&rarr;</span> <span
+                        class="ok">exit(OK)</span>
+                    <span class="c" style="color:var(--muted)"> once</span>
+                </div>
+            </div>
+            <div class="reveal">
+<pre class="code"><span class="c">// self-heal: a fault rebuilds the subtree in place</span>
+oldDb.broken = <span class="k">true</span>;
+<span class="c">// health POLLS and sees it; supervisor is PUSH-based</span>
+<span class="s">assert</span>.notEqual(health.readyz(), <span class="e">0</span>);
+<span class="s">assert</span>.equal(sup.check(), <span class="e">0</span>); <span class="c">// not told yet</span>
+
+<span class="k">await</span> sup.run(<span class="s">'db'</span>, () =&gt; c.get(<span class="s">'db'</span>).query());
+<span class="c">// rest-for-one rebuilt db + cache + api</span>
+<span class="s">assert</span>.notEqual(c.get(<span class="s">'db'</span>), oldDb);
+<span class="s">assert</span>.equal(sup.check(), <span class="e">0</span>); <span class="c">// healed, green</span>
+
+<span class="c">// a HELD lease reaches RELEASED only via</span>
+<span class="c">// container-driven dispose() &mdash; proving order</span>
+<span class="s">assert</span>.equal(leaderLock.state, LOCK.RELEASED);</pre>
+            </div>
+        </div>
+    </div>
+</section>
+
+<footer>
+    <div class="wrap">
+        <div class="foot-grid">
+            <div class="foot-note">
+                <p style="margin-bottom:10px;"><span class="status-pill"><i class="d ok"></i> kernel complete</span></p>
+                <p><b>The line is done.</b> Container 2.2.0 plus ten siblings at 1.0.0 (event-bus at 1.1.0) form a
+                    coherent, self-healing service kernel. di-signal 1.1.0 &mdash; reactive fan-in &mdash; stays a
+                    documented, torture-drafted option; nothing downstream waits on it.</p>
+            </div>
+            <div class="foot-meta">
+                npm scope &nbsp;<a href="#">@zakkster/lite-di-*</a><br>
+                license &nbsp;MIT<br>
+                author &nbsp;Zahary Shinikchiev<br>
+                proven &nbsp;lite-leak + lite-gc-profiler
+            </div>
+        </div>
+    </div>
+</footer>
+
+<script>
+    (function () {
+        var reduce = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+        // scroll reveal
+        var els = document.querySelectorAll('.reveal');
+        if (reduce || !('IntersectionObserver' in window)) {
+            els.forEach(function (e) {
+                e.classList.add('in');
+            });
+        } else {
+            var io = new IntersectionObserver(function (entries) {
+                entries.forEach(function (en) {
+                    if (en.isIntersecting) {
+                        en.target.classList.add('in');
+                        io.unobserve(en.target);
+                    }
+                });
+            }, {threshold: 0.12});
+            els.forEach(function (e) {
+                io.observe(e);
+            });
+        }
+
+        // hero signal trace (telemetry line)
+        var cv = document.getElementById('trace');
+        if (!cv) return;
+        var ctx = cv.getContext('2d');
+        var w = 0, h = 0, dpr = Math.min(window.devicePixelRatio || 1, 2);
+
+        function accent() {
+            return getComputedStyle(document.documentElement).getPropertyValue('--accent').trim() || '#4EE7D2';
+        }
+
+        function resize() {
+            w = cv.clientWidth;
+            h = cv.clientHeight;
+            cv.width = w * dpr;
+            cv.height = h * dpr;
+            ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        }
+
+        // a fixed pseudo-random-but-deterministic waveform (no Math.random)
+        function sample(x, t) {
+            return Math.sin(x * 0.018 + t) * 0.5
+                + Math.sin(x * 0.041 + t * 1.7) * 0.28
+                + Math.sin(x * 0.007 - t * 0.6) * 0.5;
+        }
+
+        function draw(t) {
+            ctx.clearRect(0, 0, w, h);
+            var col = accent();
+            var mid = h * 0.62, amp = h * 0.22;
+            ctx.lineWidth = 1.5;
+            ctx.strokeStyle = col;
+            ctx.globalAlpha = 0.85;
+            ctx.beginPath();
+            var lastX = 0, lastY = mid;
+            for (var x = 0; x <= w; x += 4) {
+                var y = mid + sample(x, t) * amp * 0.5;
+                if (x === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+                lastX = x;
+                lastY = y;
+            }
+            ctx.stroke();
+            // glowing endpoint
+            ctx.globalAlpha = 1;
+            ctx.shadowColor = col;
+            ctx.shadowBlur = 12;
+            ctx.fillStyle = col;
+            ctx.beginPath();
+            ctx.arc(lastX, lastY, 3.2, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.shadowBlur = 0;
+        }
+
+        resize();
+        window.addEventListener('resize', resize);
+        if (reduce) {
+            draw(0.6);
+            return;
+        }
+        var start = null;
+
+        function loop(ts) {
+            if (start === null) start = ts;
+            draw((ts - start) / 1000 * 0.9);
+            requestAnimationFrame(loop);
+        }
+
+        requestAnimationFrame(loop);
+    })();
+</script>

@@ -425,6 +425,12 @@ one spine. **None of them takes a hard dependency on the container** -- every mo
 duck-types it (`get` / `has` / `isBooted`) and ships with `dependencies: {}`. You add
 only the bricks a given service needs.
 
+<p align="center">
+  <img src="https://raw.githubusercontent.com/PeshoVurtoleta/lite-di-container/main/diEcosystem/ecosystem-graph.png" alt="The @zakkster/lite-di-* service kernel: the lite-di-container at the center of ten capability siblings on a ring -- graph, cron, ticker, event-bus, signal, strategies, lock, supervisor, health, and the orchestrator shutdown capstone." width="620">
+</p>
+
+<p align="center"><sub>The kernel at a glance. An interactive version lives in <a href="diEcosystem/index.html"><code>diEcosystem/index.html</code></a>.</sub></p>
+
 ### The layers
 
 Each tier sits on the container and does exactly one job the tier below does not.
