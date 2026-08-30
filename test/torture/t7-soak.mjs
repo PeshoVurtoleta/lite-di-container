@@ -1,14 +1,27 @@
 /**
- * T7 -- soak and retention (D-09, D-13).
+ * T7 -- soak and retention (D-09, D-13). The AUTHORITY is FINALIZATION, not a
+ * counter trick.
  *
  * CYCLES scope build-up / tear-down cycles off one parent. Each cycle: create a
- * child scope, register 8 scoped bindings, resolve them, track a per-cycle
- * resource with lite-leak, then drain the scope. lite-leak is an independent
- * witness -- a JS-object leak and a container-state leak cannot hide behind each
- * other. Heap is sampled ONLY at cycle boundaries.
+ * child scope, register 8 scoped bindings, resolve them, drain the scope, then
+ * track the DRAINED CHILD with lite-leak WITHOUT untracking it (cleanup NOOP +
+ * numeric tag capture NOTHING, held-value contract, so the child -- and anything
+ * it closes over -- is held only WEAKLY by the tracker's FinalizationRegistry).
+ * After the loop we settle HARD (>= 10 gc()+timer passes) and assert the
+ * finalization residual tracker.size() <= RES = max(16, CYCLES/1000): a scope
+ * that shutdown() really detached is collected (size--), one the parent still
+ * pins is not. lite-leak is an independent witness -- a JS-object leak and a
+ * container-state leak cannot hide behind each other.
  *
- * The parent-bleed invariants (law 4) are the real content here: nothing a child
- * does may write into the parent's caches or resolution order.
+ * (An earlier track+immediate-untrack asserted size()===0 -- a VACUOUS TAUTOLOGY:
+ * untrack decrements the live counter synchronously, netting to 0 every cycle even
+ * if the parent retained the child forever, and it tracked a throwaway {cycle}
+ * object rather than the scope. Fixed here per the promotion-ladder gate 2 -- a
+ * retention gate must be able to FAIL on a retained object.)
+ *
+ * The parent-bleed invariants (law 4) are the real content of the loop: nothing a
+ * child does may write into the parent's caches or resolution order. Heap is
+ * sampled ONLY at cycle boundaries.
  *
  * Drain path (D-13 fixed in D4): shutdown() now RELEASES, so it is the primary
  * drain. Alternate by parity as ../LiteBvh's t7 does: odd cycles shutdown(),
@@ -16,18 +29,49 @@
  * D4 contract, asserted every cycle.
  *
  * Sub-phase 2 soaks the D-09 shape (get -> unregister -> re-register -> get):
- * _resolutionOrder must stay at its steady-state length 1, not grow linearly.
+ * _resolutionOrder must stay at its steady-state length 1, not grow linearly. It
+ * tracks nothing (a structural growth check), so it needs no finalization gate.
+ *
+ * Sub-phase 3 soaks the invalidate/get shape (decision 0005) and tracks the
+ * FLUSHED instance under the same AUTHORITY: after invalidate() the container must
+ * hold no reference, so a released instance is finalized (size--).
+ *
+ * DI_TORTURE_BREAK=1 retains each tracked child/instance in a module sink ->
+ * size() stays ~CYCLES and BLOWS RES, tripping the residual gate DIRECTLY.
+ * (Whole-suite control; in a full run T6's control trips first -- prove the soak
+ * gate in isolation:
+ * DI_TORTURE_BREAK=1 node --expose-gc -e "import('./test/torture/t7-soak.mjs').then(m=>m.run())".)
  */
 
 import { Container } from '../../Container.js';
 import { createLeakTracker } from '@zakkster/lite-leak';
-import { check, retention, orderInvariant, STATS } from './harness.mjs';
+import { check, retention, orderInvariant, BREAK, STATS } from './harness.mjs';
 
 const CYCLES = 4096;
 const SCOPED = 8;
 const NOOP = function () {};
 
+/** AUTHORITY residual ceiling. Clean leaves single digits; a real leak leaves ~CYCLES. */
+const RES = Math.max(16, (CYCLES / 1000) | 0); // 16
+
+/** Coarse one-time-growth backstop. Loose: the tracker holds ~CYCLES leakRecords live. */
+const HEAP_CEIL = 2 * 1024 * 1024; // 2 MB
+
 const GUARD_D09 = false; // FIXED in D2 -- unregister() splices _resolutionOrder (stays at 1)
+
+/**
+ * BREAK: retains each tracked child/instance so it can NEVER be finalized ->
+ * size() stays ~CYCLES and the residual gate trips.
+ */
+const sink = [];
+
+/** Hard settle: run FinalizationRegistry callbacks to ground before reading size(). */
+async function settleHard() {
+    for (let i = 0; i < 10; i++) {
+        globalThis.gc();
+        await new Promise((r) => setTimeout(r, 15));
+    }
+}
 
 export async function run() {
     // ---- Sub-phase 1: scope churn + parent-bleed + lite-leak retention ------
@@ -47,7 +91,6 @@ export async function run() {
 
     globalThis.gc();
     const heapBefore = process.memoryUsage().heapUsed;
-    let heapPeakKB = 0;
 
     for (let cyc = 0; cyc < CYCLES; cyc++) {
         const scope = parent.scope();
@@ -60,16 +103,11 @@ export async function run() {
         check(scope.get('rootSvc') === rootInst,
             () => `T7: cycle ${cyc} lost the inherited parent instance`);
 
-        // Track a per-cycle external resource. The cleanup/tag must NOT close
-        // over the tracked target (held-value contract).
-        const h = tracker.track({ cycle: cyc }, NOOP, cyc);
-
         // Drain (D-13 fixed in D4): shutdown() now RELEASES, so it is the primary
         // drain every cycle. Even cycles also clear() (drops _registry too), as
         // ../LiteBvh's t7 alternates the drain path by parity.
         await scope.shutdown();
         if ((cyc & 1) === 0) scope.clear();
-        tracker.untrack(h);
 
         // retention 0 after shutdown() ALONE is the D4 contract.
         const r = retention(scope);
@@ -86,26 +124,31 @@ export async function run() {
         check(parent._liveChildren === liveChildrenBefore,
             () => `T7: cycle ${cyc} live-child count bled ${liveChildrenBefore} -> ${parent._liveChildren}`);
 
-        // Sample heap at the cycle BOUNDARY with a forced collection, so a lazily
-        // released structure cannot read as growth mid-cycle.
-        if ((cyc & 511) === 0) {
-            globalThis.gc();
-            const kb = (process.memoryUsage().heapUsed - heapBefore) / 1024;
-            if (kb > heapPeakKB) heapPeakKB = kb;
-        }
+        // AUTHORITY: track the DRAINED CHILD without untracking; finalization
+        // decides its fate. Neither NOOP nor the numeric tag closes over the scope
+        // (held-value contract). A scope shutdown() truly detached is collectable;
+        // one the parent still pins is not, and size() witnesses the difference.
+        tracker.track(scope, NOOP, cyc);
+        if (BREAK) sink.push(scope); // pin -> can NEVER be finalized -> size() stays high.
     }
 
-    check(tracker.size() === 0, () => `T7: lite-leak tracker leaked ${tracker.size()} resources`);
+    await settleHard();
+    const residual = tracker.size();
     const findings = tracker.audit();
-    STATS.leakSize = tracker.size();
-    STATS.leakTarget = 0;
+    STATS.leakSize = residual;
+    STATS.leakTarget = RES;
     STATS.findings = findings.length;
-    check(findings.length === 0, () => `T7: lite-leak reported ${findings.length} findings`);
 
+    check(findings.length === 0, () => `T7: lite-leak reported ${findings.length} findings`);
+    // AUTHORITY: finalization residual. A real leak would leave ~CYCLES.
+    check(residual <= RES,
+        () => `T7: AUTHORITY finalization residual size()=${residual} > ${RES} -- a scope outlived its shutdown`);
+
+    // SECONDARY (NOT the authority): coarse one-time-growth backstop.
     globalThis.gc();
     const grewKB = (process.memoryUsage().heapUsed - heapBefore) / 1024;
-    if (grewKB > heapPeakKB) heapPeakKB = grewKB;
-    check(heapPeakKB < 512, () => `T7: heap grew ${heapPeakKB.toFixed(1)} KB over ${CYCLES} cycles`);
+    check(grewKB < HEAP_CEIL / 1024,
+        () => `T7: (secondary) heap grew ${grewKB.toFixed(1)} KB over ${CYCLES} cycles`);
 
     // ---- Sub-phase 2: the D-09 shape ---------------------------------------
     // get -> unregister -> re-register -> get, repeated. The steady-state
@@ -138,7 +181,9 @@ export async function run() {
     // container: each invalidate flushes the cached instance and splices it out of
     // _resolutionOrder, and the next get() re-pushes exactly one. The steady-state
     // _resolutionOrder length must return to its baseline (1) every cycle, never
-    // grow -- and no flushed instance may be retained (lite-leak witnesses it).
+    // grow -- and no flushed instance may be retained (lite-leak witnesses it under
+    // the same AUTHORITY: track the flushed instance, never untrack, settle, gate
+    // the finalization residual).
     {
         const c = new Container();
         let built = 0;
@@ -154,15 +199,11 @@ export async function run() {
         });
 
         globalThis.gc();
-        const heapBefore = process.memoryUsage().heapUsed;
-        let peakKB = 0;
+        const heapBefore3 = process.memoryUsage().heapUsed;
 
         for (let cyc = 0; cyc < CYCLES; cyc++) {
             const inst = c.get('svc'); // cold rebuild every cycle (prev was flushed)
-            // Track the per-cycle instance; the tag/cleanup must NOT close over it.
-            const h = tracker3.track(inst, NOOP, cyc);
             await c.invalidate('svc');
-            tracker3.untrack(h);
 
             check(c._resolutionOrder.length === 0,
                 () => `T7.invalidate-soak: cycle ${cyc} resolution order is ${c._resolutionOrder.length} after invalidate, expected 0`);
@@ -171,24 +212,30 @@ export async function run() {
             check(orderInvariant(c),
                 () => `T7.invalidate-soak: cycle ${cyc} broke orderInvariant`);
 
-            if ((cyc & 511) === 0) {
-                globalThis.gc();
-                const kb = (process.memoryUsage().heapUsed - heapBefore) / 1024;
-                if (kb > peakKB) peakKB = kb;
-            }
+            // AUTHORITY: track the FLUSHED instance without untracking. After
+            // invalidate() the container holds no reference, so a truly released
+            // instance is finalized (size--); one the container still pins is not.
+            // Tag/cleanup must NOT close over it (held-value contract).
+            tracker3.track(inst, NOOP, cyc);
+            if (BREAK) sink.push(inst); // pin -> can NEVER be finalized -> size() stays high.
         }
 
-        check(tracker3.size() === 0,
-            () => `T7.invalidate-soak: lite-leak tracker leaked ${tracker3.size()} instances`);
+        await settleHard();
+        const residual3 = tracker3.size();
         const findings3 = tracker3.audit();
+        STATS.leakSize = residual3 > STATS.leakSize ? residual3 : STATS.leakSize;
+        STATS.findings += findings3.length;
+
         check(findings3.length === 0,
             () => `T7.invalidate-soak: lite-leak reported ${findings3.length} findings`);
+        check(residual3 <= RES,
+            () => `T7.invalidate-soak: AUTHORITY finalization residual size()=${residual3} > ${RES} -- an instance outlived its invalidate`);
 
+        // SECONDARY (NOT the authority): coarse one-time-growth backstop.
         globalThis.gc();
-        const grewKB = (process.memoryUsage().heapUsed - heapBefore) / 1024;
-        if (grewKB > peakKB) peakKB = grewKB;
-        check(peakKB < 512,
-            () => `T7.invalidate-soak: heap grew ${peakKB.toFixed(1)} KB over ${CYCLES} invalidate cycles`);
+        const grewKB3 = (process.memoryUsage().heapUsed - heapBefore3) / 1024;
+        check(grewKB3 < HEAP_CEIL / 1024,
+            () => `T7.invalidate-soak: (secondary) heap grew ${grewKB3.toFixed(1)} KB over ${CYCLES} invalidate cycles`);
         check(built === CYCLES,
             () => `T7.invalidate-soak: expected ${CYCLES} rebuilds, got ${built}`);
     }

@@ -457,7 +457,7 @@ graph TD
         STRAT["lite-di-strategies<br/>dispatch router"]
         GRAPH["lite-di-graph<br/>describe() exporters"]
     end
-    CORE["lite-di-container 2.2.0<br/>resolution + boot validation<br/>reverse-topo teardown + rebind"]
+    CORE["lite-di-container 2.2.1<br/>resolution + boot validation<br/>reverse-topo teardown + rebind"]
 
     ORCH --> CORE
     SUP --> CORE
@@ -527,7 +527,7 @@ Taglines are each package's own `llms.txt` positioning line.
 
 | Module | The one job only it does | Role |
 | ------ | ------------------------ | ---- |
-| **`lite-di-container`** `2.2.0` | resolution + boot-time graph validation + reverse-topo teardown + post-boot `invalidate`/`rebind` hot-swap | the base (rebind = GAP-3) |
+| **`lite-di-container`** `2.2.1` | resolution + boot-time graph validation + reverse-topo teardown + post-boot `invalidate`/`rebind` hot-swap | the base (rebind = GAP-3) |
 | `lite-di-strategies` | fail-closed zero-GC strategy router over a booted container | read-path dispatch hinge |
 | `lite-di-graph` | read-only JSON / Graphviz-DOT / Chrome-Trace exporters over a `describe()` snapshot | topology observability |
 | `lite-di-event-bus` | DI-constructed handlers under a boot-locked `multi`, dispatched by index over one bus buffer | zero-alloc fan-out |
