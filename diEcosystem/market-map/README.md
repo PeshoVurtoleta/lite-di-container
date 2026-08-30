@@ -5,28 +5,37 @@ built from the actual `lite-di-*` packages, running **in the browser** with a th
 Canvas2D order-book viz. It is the "hybrid" demo -- the headless kernel does the real
 work; the visualization is the `ticker`/render showcase on top.
 
-## Run it -- two processes
+## Run it
 
-**1. The tick feed** (a zero-dep Node WebSocket server streaming synthetic ticks):
+**Live (nothing to install):** https://zakkster.github.io/LiteDiContainer/diEcosystem/market-map/
+
+It opens cold and paints a moving price trace + order-book ladder within ~3s. The default
+feed is a **live Binance BTCUSDT** stream; if that socket is unreachable, a supervised
+watchdog degrades to an **in-page simulation** within ~5s (watch the event log) -- so the
+demo is never a blank canvas.
+
+**Run locally** -- serve *this directory* over any static server:
 
 ```bash
-cd /Users/zakkster/Work/Portfolio/LiteLibrariesSuite/LiteDiContainer/diEcosystem/market-map
-node feed-server.mjs            # ws://127.0.0.1:8100
-```
-
-**2. The page** (served from the **suite root** -- the import map uses root-absolute paths):
-
-```bash
-cd /Users/zakkster/Work/Portfolio/LiteLibrariesSuite
 python3 -m http.server 8099 --bind 127.0.0.1
 ```
 
-Then open: `http://127.0.0.1:8099/LiteDiContainer/diEcosystem/market-map/index.html`
-(If the feed server is down, `lite-ws` sits in `reconnecting` with backoff -- graceful.)
+Then open `http://127.0.0.1:8099/` from within this folder. The import map is pinned to
+published packages on a CDN, so no `node_modules` and no build step are needed -- just a
+static file server.
+
+**Optional local feed** -- a zero-dep Node WebSocket server streaming synthetic ticks, for
+offline work against a controllable source:
+
+```bash
+node feed-server.mjs            # ws://127.0.0.1:8100
+```
+
+Then pick **local (feed-server)** in the feed selector.
 
 No build step, no bundler. Every package is zero-dep single-file ESM, resolved in-browser
-by the import map (di-* mains directly; `lite-raf` / `lite-signal` from
-`LiteDiTicker/node_modules/`; `lite-ws` / `lite-ring-buffer` / `lite-gl` from their repos).
+by a version-pinned import map (see the comment above the map in `index.html` for the
+pin-bump procedure).
 
 ## What each package does here
 
@@ -41,7 +50,7 @@ by the import map (di-* mains directly; `lite-raf` / `lite-signal` from
 | `lite-di-supervisor` | watches the feed subsystem; on a fault it re-resolves a **fresh socket** without dropping the render loop |
 | `lite-di-health` | `readyz` / `livez` over the feed + supervisor |
 | `lite-di-graph` | exports the booted dependency graph (node count / a JSON profile) |
-| **`lite-ws`** | the **real WebSocket feed**: `onMessage` pipes each tick to the bus (0-GC), while `status` / `latency` / `reconnectAttempts` stay coarse reactive signals; built-in reconnect + backoff. Selectable at runtime between the local `feed-server` and a **live Binance `@bookTicker`** stream (real bid/ask over wss, no auth) |
+| **`lite-ws`** | the **real WebSocket feed**: `onMessage` pipes each tick to the bus (0-GC), while `status` / `latency` / `reconnectAttempts` stay coarse reactive signals; built-in reconnect + backoff. Selectable at runtime between a **live Binance `@bookTicker`** stream (default; real bid/ask over wss, no auth), an **in-page simulation** (synthetic random walk, the supervised failover), and the local `feed-server` |
 | **`lite-ring-buffer`** | the pow2, bitmask-wrap `Float32Array` tick ring -- the 0-GC hot data the firehose lands in |
 | **`lite-gl`** | instanced WebGL2 renderer: the tick cloud via `createPointSink` **and the depth ladder via `createQuadSink`** (the whole order book on the GPU); scales to ~1M primitives |
 
@@ -72,6 +81,8 @@ miniature: self-healing, fail-closed, zero-GC steady state -- over a real socket
 
 With **Binance** selected the transport AND the top-of-book (`bid` / `ask` / `mid`) are
 **real, live data**; the multi-level ladder is still synthesized around that best quote
-(`@bookTicker` carries only the top). With **local** selected, `feed-server.mjs` streams a
-synthetic random walk. Either way it shows the **architecture and package composition** at
-real firehose rates -- not a trading system.
+(`@bookTicker` carries only the top). The **simulation** source is fully synthetic -- a
+labeled in-page random walk, used as the automatic failover when the live socket is
+unreachable (it is never presented as real data). With **local** selected, `feed-server.mjs`
+streams a synthetic random walk. Either way it shows the **architecture and package
+composition** at real firehose rates -- not a trading system.

@@ -27,14 +27,16 @@ import {createPointSink, createQuadSink} from '@zakkster/lite-gl/backend';
 
 const RING = 2048;                 // SEAM: size to your firehose window
 const LVL = 16;                   // order-book depth levels per side
-// Feed sources. `local` is the reliable default (feed-server.mjs); the Binance public
-// bookTicker streams REAL best bid/ask over wss, no auth. Selectable at runtime.
+// Feed sources. Binance public bookTicker streams REAL best bid/ask over wss (no auth)
+// and is the default; `sim` is the in-page synthetic failover the watchdog degrades to;
+// `local` targets feed-server.mjs. Selectable at runtime.
 const SOURCES = {
-    local: 'ws://127.0.0.1:8100',
     'BTCUSDT': 'wss://stream.binance.com:9443/ws/btcusdt@bookTicker',
     'ETHUSDT': 'wss://stream.binance.com:9443/ws/ethusdt@bookTicker',
+    sim: 'sim://random-walk',
+    local: 'ws://127.0.0.1:8100',
 };
-const FEED_URL = SOURCES.local;
+const FEED_URL = SOURCES.BTCUSDT;
 
 // Normalize a raw frame from either the local server or Binance bookTicker to a tick.
 function parseTick(raw) {
@@ -84,6 +86,54 @@ class Aggregates {
     }
 }
 
+// Simulation feed. Duck-types the exact lite-ws surface the render loop pulls
+// (status/isOpen/latency/reconnectAttempts/poll/dispose), so `makeSocket` resolves it
+// ONCE and the hot body stays source-agnostic -- no `if (isSim)` in update/feedPoll.
+// poll() is the generator: a wall-clock accumulator emits ~SIM_HZ ticks/s via a random
+// walk. ZERO per-call allocation -- one scratch tick object, mutated in place and
+// consumed synchronously by the object bus (never recorded; the numeric trace bus carries
+// the scalar for replay). This is the shape S6's scripted fake socket must satisfy.
+const SIM_HZ = 50;                 // target ticks / second
+const SIM_STEP = 6;                // random-walk price step (USD)
+const SIM_HALF_SPREAD = 0.75;      // synthetic half-spread (USD)
+const SIM_MAX_BURST = 8;           // cap ticks per poll so a stalled tab cannot spiral
+
+function makeSimSocket(emit) {
+    const tick = {mid: 60000, bid: 60000, ask: 60000, t: 0};
+    let last = performance.now(), acc = 0, seq = 0;
+    return {
+        status() {
+            return 'open';
+        },
+        isOpen() {
+            return true;
+        },
+        latency() {
+            return 1 + (Math.random() * 2 | 0);
+        },
+        reconnectAttempts() {
+            return 0;
+        },
+        poll() {
+            const now = performance.now();
+            acc += (now - last) * (SIM_HZ / 1000);
+            last = now;
+            let k = acc | 0;
+            acc -= k;
+            if (k > SIM_MAX_BURST) k = SIM_MAX_BURST;
+            for (let i = 0; i < k; i++) {
+                tick.mid += (Math.random() - 0.5) * SIM_STEP;
+                tick.bid = tick.mid - SIM_HALF_SPREAD;
+                tick.ask = tick.mid + SIM_HALF_SPREAD;
+                tick.t = ++seq;
+                emit(tick);
+            }
+        },
+        dispose() {
+        },
+    };
+}
+
 // The ingestion subsystem the supervisor watches: a lite-ws socket. Re-resolving it
 // (on a fault) tears down the old socket and dials a fresh one.
 class Feed {
@@ -130,8 +180,22 @@ class AggApply {
     }
 }
 
+// Trace-bus handler. The numeric traceBus records mid SCALARS live (0 B/emit, unboxed
+// doubles); its capture drives replay. This handler pushes into the tape ONLY while
+// replaying (refs.replaying) -- live, TapeApply already fills the tape off the object bus,
+// so gating here avoids a double-advance while still repainting the price trace on replay.
+class MidReplay {
+    constructor(tape) {
+        this.tape = tape;
+    }
+
+    handle(mid) {
+        if (refs.replaying) this.tape.push(mid);
+    }
+}
+
 // cron jobs: DI-constructed wall-clock housekeeping.
-const refs = {stats: {pruned: 0, aggregations: 0, heartbeats: 0}};
+const refs = {stats: {pruned: 0, aggregations: 0, heartbeats: 0}, replaying: false};
 
 class AggregateJob {
     run() {
@@ -148,6 +212,30 @@ class PruneJob {
 class HeartbeatJob {
     run() {
         refs.stats.heartbeats++;
+    }
+}
+
+// Failover watchdog -- a supervised, graph-resident cron job (NOT a stray timer). It
+// counts consecutive 1s samples where the feed is down and, at 4 in a row (~4s) while not
+// already on sim, degrades to the in-page simulation via the same code path as a manual
+// switch. A class (not a closure) so S3 can register one per symbol scope. All control
+// state lives on the injected `ctrl` (armed / count / down / isSim / trip).
+class FailoverJob {
+    constructor(ctrl) {
+        this.ctrl = ctrl;
+    }
+
+    run() {
+        const f = this.ctrl;
+        if (!f.armed || f.isSim()) {
+            f.count = 0;
+            return;
+        }
+        f.count = f.down() ? f.count + 1 : 0;
+        if (f.count >= 4) {
+            f.count = 0;
+            f.trip();
+        }
     }
 }
 
@@ -272,7 +360,11 @@ class GLRenderer {
     draw(v, book, scratch, n) {
         const sink = v.glSink;
         if (!sink) return;
-        const gl = sink.gl, w = v.w, h = v.h, plotW = w * 0.66;
+        // Retina: the GL backing store is DEVICE px. Fold dpr into the size scalars ONCE
+        // here (w/h and the fixed pixel offsets), so the per-vertex loop keeps its shape --
+        // no per-vertex multiply -- and the GL geometry aligns with the dpr-transformed 2D
+        // ladder within 1 CSS px.
+        const dpr = v.dpr, gl = sink.gl, w = v.w * dpr, h = v.h * dpr, plotW = w * 0.66;
         sink.resize(w, h);
         gl.enable(gl.BLEND);
         gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);   // translucent bars
@@ -281,25 +373,25 @@ class GLRenderer {
         const qsink = v.glQuadSink;
         if (qsink) {
             qsink.resize(w, h);
-            const q = this.quads, ladderX = plotW + 24, ladderW = w - ladderX - 16, midY = h / 2,
-                rowH = (h * 0.9) / (LVL * 2);
+            const q = this.quads, ladderX = plotW + 24 * dpr, ladderW = w - ladderX - 16 * dpr,
+                midY = h / 2, rowH = (h * 0.9) / (LVL * 2), barH = rowH - 2 * dpr, scale = ladderW / 48;
             let k = 0;
             for (let i = 0; i < LVL; i++) {
-                const aw = Math.min(ladderW, book.askSz[i] * (ladderW / 48)), ay = midY - (i + 1) * rowH;
+                const aw = Math.min(ladderW, book.askSz[i] * scale), ay = midY - (i + 1) * rowH;
                 q[k++] = ladderX + aw / 2;
                 q[k++] = ay + rowH / 2;
                 q[k++] = aw;
-                q[k++] = rowH - 2;
+                q[k++] = barH;
                 q[k++] = 0;
                 q[k++] = 0.96;
                 q[k++] = 0.65;
                 q[k++] = 0.14;
                 q[k++] = 0.6;                       // ask amber
-                const bw = Math.min(ladderW, book.bidSz[i] * (ladderW / 48)), by = midY + i * rowH;
+                const bw = Math.min(ladderW, book.bidSz[i] * scale), by = midY + i * rowH;
                 q[k++] = ladderX + bw / 2;
                 q[k++] = by + rowH / 2;
                 q[k++] = bw;
-                q[k++] = rowH - 2;
+                q[k++] = barH;
                 q[k++] = 0;
                 q[k++] = 0.306;
                 q[k++] = 0.906;
@@ -322,13 +414,13 @@ class GLRenderer {
                 lo = 0;
                 hi = 1;
             }
-            const span = (hi - lo) || 1;
-            const d = this.pts;
+            const span = (hi - lo) || 1, d = this.pts,
+                usableH = h - 24 * dpr, botPad = 12 * dpr, ptSize = 3.5 * dpr, denom = (n - 1 || 1);
             for (let i = 0; i < n; i++) {
                 const b = i * 8;
-                d[b] = (i / (n - 1 || 1)) * plotW;
-                d[b + 1] = h - ((scratch[i] - lo) / span) * (h - 24) - 12;
-                d[b + 2] = 3.5;
+                d[b] = (i / denom) * plotW;
+                d[b + 1] = h - ((scratch[i] - lo) / span) * usableH - botPad;
+                d[b + 2] = ptSize;
                 d[b + 3] = 0.306;
                 d[b + 4] = 0.906;
                 d[b + 5] = 0.82;
@@ -362,10 +454,10 @@ class RenderSystem {
     }
 }
 
-export async function bootKernel({ctx, gl, w, h, onEvent, onMode}) {
+export async function bootKernel({ctx, gl, w, h, dpr, onEvent, onMode}) {
     const log = (kind, msg) => onEvent && onEvent(kind, msg);
     const viz = {
-        ctx, w, h, zoom: 1, router: null, scratch: new Float32Array(RING), feedPoll: null,
+        ctx, w, h, dpr: dpr || 1, zoom: 1, router: null, scratch: new Float32Array(RING), feedPoll: null,
         glSink: null, glQuadSink: null, setMode: onMode || null
     };
     try {                                                                        // lite-gl WebGL2 sinks
@@ -389,27 +481,50 @@ export async function bootKernel({ctx, gl, w, h, onEvent, onMode}) {
     c.value('renderer:detailed', new DetailedRenderer());
     c.value('renderer:gpu', new GLRenderer());               // lite-gl instanced points + quads
 
-    // event-bus fan-out (boot-locked topology)
+    // event-bus fan-out (boot-locked topology). The OBJECT bus is NOT recorded: its
+    // handlers consume each tick synchronously, so S2 may reuse per-tag scratch freely.
     const bus = new EventBus(c);
     bus.on('tick', BookApply, ['book']).on('tick', TapeApply, ['tape']).on('tick', AggApply, ['agg']);
+
+    // Dedicated numeric flight-recorder. Carries mid SCALARS only -- an unboxed-double
+    // payload array, so each capture is an inline store (no per-tick HeapNumber boxing) and
+    // replay is honest (replaying object references off the reused-scratch bus would redraw
+    // a flat line). This is the recorded bus; the object bus above is not.
+    const traceBus = new EventBus(c);
+    traceBus.on('mid', MidReplay, ['tape']);
+    c.value('traceBus', traceBus);
+    c.onTeardown('traceBus', (b) => {
+        try {
+            b.dispose();
+        } catch {
+        }
+    });
 
     // lite-ws: bind lifecycle signals to the SAME scoped registry, then dial the feed.
     // onMessage is the per-message pipe (0 B/emit fan-out); status/latency stay coarse signals.
     const {createSocket} = createSocketFactory(rx.registry);
     let tickCount = 0, feedUrl = FEED_URL;
-    const makeSocket = () => createSocket(feedUrl, {
-        onMessage: (data) => {
-            try {
-                const t = parseTick(data);
-                if (t) {
-                    bus.emit('tick', t);
-                    tickCount++;
+    // Single tick dispatch point. Both the wire path (parseTick -> emitTick) and the sim
+    // path (makeSimSocket -> emitTick) funnel through here: one object fan-out, one counter,
+    // one scalar recorded. S2's `trade` channel attaches here too.
+    const emitTick = (t) => {
+        bus.emit('tick', t);            // object fan-out (synchronous, unrecorded)
+        tickCount++;
+        traceBus.emit('mid', t.mid);    // scalar-only, recorded -> zero-GC honest replay
+    };
+    // Resolve sim vs wire ONCE, here. The hot body never sees the distinction.
+    const makeSocket = () => feedUrl.startsWith('sim://')
+        ? makeSimSocket(emitTick)
+        : createSocket(feedUrl, {
+            onMessage: (data) => {
+                try {
+                    const t = parseTick(data);
+                    if (t) emitTick(t);
+                } catch {
                 }
-            } catch {
-            }
-        },
-        backoff: {min: 250, max: 4000, factor: 2, jitter: 0.5},
-    });
+            },
+            backoff: {min: 250, max: 4000, factor: 2, jitter: 0.5},
+        });
     c.value('makeSocket', makeSocket);
     c.singleton('feed', Feed, ['makeSocket']);
     // Hot-path cache: hold the resolved socket so the render loop never does c.get('feed')
@@ -458,8 +573,35 @@ export async function bootKernel({ctx, gl, w, h, onEvent, onMode}) {
     });
     health.watchSupervisor('supervisor', sup, LANES.READY);
 
+    // Shared degrade path: switch feedUrl, clear the ring (price scale differs), log, and
+    // fault the feed so the supervisor re-resolves a fresh socket. Used by BOTH a manual
+    // source switch and the failover watchdog -- one place holds tape.reset + reportFault.
+    const degradeTo = (url, kind, msg) => {
+        feedUrl = url;
+        try {
+            c.get('tape').reset();
+        } catch {
+        }
+        log(kind, msg);
+        sup.reportFault('feed').catch(() => {
+        });
+    };
+
+    // Watchdog control surface (injected into FailoverJob). Closures read the live locals;
+    // `armed` is disarmed permanently by the first manual setSource (a choice must stick).
+    const failover = {
+        armed: true,
+        count: 0,
+        down: () => !activeSock || !activeSock.isOpen(),
+        isSim: () => feedUrl.startsWith('sim://'),
+        trip: () => degradeTo(SOURCES.sim, 'escalate', 'live feed unreachable -- degrading to simulation'),
+    };
+    c.value('failover', failover);
+    cron.job('failover', FailoverJob, interval(1000), {deps: ['failover']});
+
     c.boot();
     bus.boot();
+    traceBus.boot();
     await sup.start();                                        // resolves 'feed' -> opens the socket
     refreshFeed();                                            // cache the initial socket for the hot path
 
@@ -477,7 +619,7 @@ export async function bootKernel({ctx, gl, w, h, onEvent, onMode}) {
         }
     };  // cached ref, no per-frame c.get
 
-    bus.record(RING, {onOverflow: 'drop-oldest'});         // event-bus 1.1.0 flight recorder
+    traceBus.record(RING, {onOverflow: 'drop-oldest'});    // event-bus 1.1.0 flight recorder (scalars only)
     ticker.start();
     cron.start();
 
@@ -513,7 +655,7 @@ export async function bootKernel({ctx, gl, w, h, onEvent, onMode}) {
             return {
                 mid: agg.mid(), bid: agg.bid(), ask: agg.ask(), spread: agg.spread(), tps,
                 readyz: health.readyz(), livez: health.livez(), supState: sup.state, restarts,
-                recorded: bus.recorded(), nodeCount, jobs: refs.stats,
+                recorded: traceBus.recorded(), nodeCount, jobs: refs.stats,
                 status, latency, attempts, open,
             };
         },
@@ -521,14 +663,8 @@ export async function bootKernel({ctx, gl, w, h, onEvent, onMode}) {
             viz.zoom = z;
         },
         setSource(url) {                                          // switch feed, re-dial via supervisor
-            feedUrl = url;
-            try {
-                c.get('tape').reset();
-            } catch {
-            }               // price scale differs -> clear the ring
-            log('heal', 'switching feed -> ' + url.replace(/^wss?:\/\//, ''));
-            sup.reportFault('feed').catch(() => {
-            });
+            failover.armed = false;                               // a manual choice disarms the watchdog for good
+            degradeTo(url, 'heal', 'switching feed -> ' + url.replace(/^wss?:\/\//, ''));
         },
         sources: SOURCES,
         killFeed() {
@@ -536,13 +672,20 @@ export async function bootKernel({ctx, gl, w, h, onEvent, onMode}) {
             });
         },   // subsystem fault -> supervisor heal
         replay() {
-            const n = bus.replay();
+            refs.replaying = true;                                // MidReplay pushes to tape only while this is set
+            let n = 0;
+            try {
+                n = traceBus.replay();
+            } finally {
+                refs.replaying = false;
+            }
             log('replay', 'replayed ' + n + ' recorded ticks');
             return n;
         },
-        resize(nw, nh) {
+        resize(nw, nh, ndpr) {
             viz.w = nw;
             viz.h = nh;
+            if (ndpr) viz.dpr = ndpr;
         },
         stop() {
             clearInterval(tpsTimer);
@@ -550,6 +693,10 @@ export async function bootKernel({ctx, gl, w, h, onEvent, onMode}) {
             cron.stop();
             try {
                 if (activeSock) activeSock.dispose();
+            } catch {
+            }
+            try {
+                traceBus.dispose();
             } catch {
             }
         },
