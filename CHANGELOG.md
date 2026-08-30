@@ -4,6 +4,27 @@ All notable changes to `@zakkster/lite-di-container` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/); this project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.2.1] - 2026-08-31
+
+### Changed
+
+- **T7 soak torture gate (`test/torture/t7-soak.mjs`) -- retention is now proven
+  by finalization, not a counter identity.** Both retention sub-phases previously
+  did `tracker.track(obj)` then `tracker.untrack(h)` and asserted
+  `tracker.size() === 0`. Because `untrack` decrements the live counter
+  synchronously, that assertion held even if the object were retained forever --
+  a tautology that could not fail; sub-phase 1 also tracked a throwaway `{cycle}`
+  object rather than the real resource. Both sub-phases now track the real
+  per-cycle resource (the drained child scope; the flushed instance) WITHOUT
+  untracking, settle hard (10x `gc()` + timer), and gate the finalization residual
+  `tracker.size() <= RES = max(16, CYCLES/1000) = 16` with a clean `audit()`.
+  `DI_TORTURE_BREAK=1` pins each tracked resource in a module sink so the gate
+  trips (measured residual 4096 > 16, exit 1); the clean run measures residual 0.
+  Matches the AUTHORITY pattern shared by the ten `lite-di-*` siblings. The strict
+  512 KB mid-loop heap sampler is replaced by a coarse 2 MB post-loop backstop
+  (the tracker now holds ~CYCLES leak records live). Test-only: `test/` is not in
+  `files[]`, so the published tarball has no runtime change from 2.2.0.
+
 ## [2.2.0] - 2026-08-10
 
 ### Added

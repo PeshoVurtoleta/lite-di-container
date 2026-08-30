@@ -9,7 +9,7 @@
  *  - Full integration testing lifecycle hooks (reset, unregister, clear).
  */
 
-const VERSION = '2.2.0';
+const VERSION = '2.2.1';
 
 const TYPES = Object.freeze({
     VALUE: 0,
