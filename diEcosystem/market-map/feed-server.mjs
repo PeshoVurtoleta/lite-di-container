@@ -40,18 +40,39 @@ server.on('upgrade', (req, socket) => {
         'Upgrade: websocket\r\nConnection: Upgrade\r\n' +
         'Sec-WebSocket-Accept: ' + accept + '\r\n\r\n');
 
-    // per-connection random walk
-    let mid = 100 + Math.random() * 40, seq = 0, alive = true;
-    const BATCH = 6;
+    // per-connection random walk. Emits the SAME shapes as the live Binance combined
+    // stream: a depth20 partial snapshot every 100ms and an aggTrade roughly every 300ms.
+    // (This is the LOCAL synthetic feed; allocation here is irrelevant -- it is a dev tool,
+    // not a browser hot path.) A 20-level depth payload exceeds 126 bytes, so it exercises
+    // the 2-byte extended-length branch in textFrame that the old top-of-book shape never hit.
+    let mid = 100 + Math.random() * 40, seq = 0, aggId = 0, tick = 0, alive = true;
+    const emitDepth = () => {
+        mid += (Math.random() - 0.5) * 0.8;
+        const half = 0.4 + Math.random() * 0.3;
+        const bids = [], asks = [];
+        for (let i = 0; i < 20; i++) {
+            bids.push([(mid - half - i * 0.01).toFixed(2), (Math.random() * 5).toFixed(5)]);
+            asks.push([(mid + half + i * 0.01).toFixed(2), (Math.random() * 5).toFixed(5)]);
+        }
+        const msg = JSON.stringify({ stream: 'btcusdt@depth20@100ms', data: { lastUpdateId: ++seq, bids, asks } });
+        try { socket.write(textFrame(msg)); } catch { /* backpressure/closed */ }
+    };
+    const emitAgg = () => {
+        const now = Date.now();
+        const msg = JSON.stringify({
+            stream: 'btcusdt@aggTrade',
+            data: { e: 'aggTrade', E: now, s: 'BTCUSDT', a: ++aggId,
+                p: (mid + (Math.random() - 0.5)).toFixed(2), q: (Math.random() * 0.5).toFixed(5),
+                m: Math.random() < 0.5, M: true, T: now },
+        });
+        try { socket.write(textFrame(msg)); } catch { /* backpressure/closed */ }
+    };
     const timer = setInterval(() => {
         if (!alive) return;
-        for (let i = 0; i < BATCH; i++) {
-            mid += (Math.random() - 0.5) * 0.8;
-            const spread = 0.4 + Math.random() * 0.3;
-            const msg = JSON.stringify({ mid, bid: mid - spread / 2, ask: mid + spread / 2, t: ++seq });
-            try { socket.write(textFrame(msg)); } catch { /* backpressure/closed */ }
-        }
-    }, 16);
+        emitDepth();
+        if ((tick % 3) === 0) emitAgg();
+        tick++;
+    }, 100);
 
     // respond to a client heartbeat ping (lite-ws sends an app-level payload the server echoes)
     let buf = Buffer.alloc(0);

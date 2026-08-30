@@ -50,7 +50,7 @@ pin-bump procedure).
 | `lite-di-supervisor` | watches the feed subsystem; on a fault it re-resolves a **fresh socket** without dropping the render loop |
 | `lite-di-health` | `readyz` / `livez` over the feed + supervisor |
 | `lite-di-graph` | exports the booted dependency graph (node count / a JSON profile) |
-| **`lite-ws`** | the **real WebSocket feed**: `onMessage` pipes each tick to the bus (0-GC), while `status` / `latency` / `reconnectAttempts` stay coarse reactive signals; built-in reconnect + backoff. Selectable at runtime between a **live Binance `@bookTicker`** stream (default; real bid/ask over wss, no auth), an **in-page simulation** (synthetic random walk, the supervised failover), and the local `feed-server` |
+| **`lite-ws`** | the **real WebSocket feed**: `onMessage` pipes each decoded frame to the bus (0-GC), while `status` / `latency` / `reconnectAttempts` stay coarse reactive signals; built-in reconnect + backoff. Selectable at runtime between a **live Binance combined stream** (default; `@depth20@100ms` + `@aggTrade` + `@bookTicker` over wss, no auth), an **in-page simulation** (synthetic random walk, the supervised failover), and the local `feed-server` |
 | **`lite-ring-buffer`** | the pow2, bitmask-wrap `Float32Array` tick ring -- the 0-GC hot data the firehose lands in |
 | **`lite-gl`** | instanced WebGL2 renderer: the tick cloud via `createPointSink` **and the depth ladder via `createQuadSink`** (the whole order book on the GPU); scales to ~1M primitives |
 
@@ -70,19 +70,28 @@ miniature: self-healing, fail-closed, zero-GC steady state -- over a real socket
 
 ## Seams to turn this into a product (grep `SEAM:` in `kernel.js` / `feed-server.mjs`)
 
-- **Done:** real WebSocket transport (`lite-ws`, incl. a live Binance feed), GPU rendering
-  of both the tick cloud and the order book (`lite-gl` point + quad sinks).
-- Subscribe to a real DEPTH stream (e.g. `@depth20`) instead of `@bookTicker` (top-of-book
-  only) to drive the full ladder from real levels, not a synthesized spread.
+- **Done:** real WebSocket transport (`lite-ws`, incl. a live Binance combined feed); a REAL
+  20-level depth ladder (`@depth20@100ms`) and a REAL trade tape (`@aggTrade`) off the wire,
+  driving the full ladder from real levels instead of a synthesized spread; GPU rendering of
+  the tick cloud, the trades and the order book (`lite-gl` point + quad sinks).
 - Grow `RING` toward `lite-gl`'s ~1M; offer the `graph` JSON (`toJSON`) as a downloadable
   performance profile; add a WebGL LINE sink for a thick price polyline.
 
 ## Honest caveats
 
-With **Binance** selected the transport AND the top-of-book (`bid` / `ask` / `mid`) are
-**real, live data**; the multi-level ladder is still synthesized around that best quote
-(`@bookTicker` carries only the top). The **simulation** source is fully synthetic -- a
-labeled in-page random walk, used as the automatic failover when the live socket is
-unreachable (it is never presented as real data). With **local** selected, `feed-server.mjs`
-streams a synthetic random walk. Either way it shows the **architecture and package
-composition** at real firehose rates -- not a trading system.
+With **Binance** selected the transport, the top-of-book (`bid` / `ask` / `mid`), the
+**20-level ladder** (`@depth20@100ms`) and the **trade tape** (`@aggTrade`) are all **real,
+live data** -- the ladder is drawn from real depth levels and every trade dot is a real
+aggregated trade off the wire. The dense price trace comes from the combined `@bookTicker`
+quote; a live quote never overwrites the real depth ladder -- the ladder is fabricated only
+when no real depth is arriving (the simulation). `@depth20` is consumed as a
+**partial-book snapshot**: each frame replaces the top 20 levels wholesale, with no `U`/`u`
+diff-sequence maintenance or resync (that is what keeps the apply zero-allocation).
+
+The **simulation** source is fully synthetic and fabricates its ladder from a single quote,
+so the HUD `ladder` row reads **SYNTH** -- it is the labeled in-page failover used when the
+live socket is unreachable, never presented as real data. With **local** selected,
+`feed-server.mjs` streams synthetic depth + trade frames in the exact Binance shape, so the
+ladder is driven from real depth arrays (HUD reads **WIRE**) even though the underlying
+numbers are synthetic; only the live Binance feed is real market data. Either way it shows
+the **architecture and package composition** at real firehose rates -- not a trading system.

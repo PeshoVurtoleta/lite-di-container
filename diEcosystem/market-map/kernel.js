@@ -1,4 +1,4 @@
-// market-map -- a SKELETON demo of the @zakkster/lite-di-* service kernel applied to a
+// market-map -- a demo of the @zakkster/lite-di-* service kernel applied to a
 // real-time market-data firehose, now fed by a REAL WebSocket (@zakkster/lite-ws) over a
 // zero-GC ring (@zakkster/lite-ring-buffer). Everything runs in-browser via the import map.
 //
@@ -24,50 +24,24 @@ import {createRegistry} from '@zakkster/lite-signal';
 import {createSocketFactory} from '@zakkster/lite-ws';
 import {RingBuffer} from '@zakkster/lite-ring-buffer';
 import {createPointSink, createQuadSink} from '@zakkster/lite-gl/backend';
+import {TAG_QUOTE, TAG_DEPTH, TAG_TRADE, MAXLVL, parseFrame, OrderBook} from './Frames.js';
 
 const RING = 2048;                 // SEAM: size to your firehose window
-const LVL = 16;                   // order-book depth levels per side
-// Feed sources. Binance public bookTicker streams REAL best bid/ask over wss (no auth)
-// and is the default; `sim` is the in-page synthetic failover the watchdog degrades to;
-// `local` targets feed-server.mjs. Selectable at runtime.
+const TRADE_RING = 256;            // recent-trade window (pow2, scalar rings)
+const TAU = Math.PI * 2;
+const DOT_BUY = '#4EE7D2';         // taker-buy trade dot (teal)
+const DOT_SELL = '#F5A623';        // taker-sell trade dot (ember)
+// Feed sources. Each live symbol is ONE combined Binance stream carrying three
+// channels: depth20@100ms (the REAL 20-level ladder), aggTrade (the trade tape),
+// and bookTicker (a dense best-quote for the price trace). `sim` is the in-page
+// synthetic failover the watchdog degrades to; `local` targets feed-server.mjs.
 const SOURCES = {
-    'BTCUSDT': 'wss://stream.binance.com:9443/ws/btcusdt@bookTicker',
-    'ETHUSDT': 'wss://stream.binance.com:9443/ws/ethusdt@bookTicker',
+    'BTCUSDT': 'wss://stream.binance.com:9443/stream?streams=btcusdt@depth20@100ms/btcusdt@aggTrade/btcusdt@bookTicker',
+    'ETHUSDT': 'wss://stream.binance.com:9443/stream?streams=ethusdt@depth20@100ms/ethusdt@aggTrade/ethusdt@bookTicker',
     sim: 'sim://random-walk',
     local: 'ws://127.0.0.1:8100',
 };
 const FEED_URL = SOURCES.BTCUSDT;
-
-// Normalize a raw frame from either the local server or Binance bookTicker to a tick.
-function parseTick(raw) {
-    const m = JSON.parse(raw);
-    if (m.b !== undefined && m.a !== undefined) {            // Binance bookTicker: b=bid, a=ask
-        const bid = +m.b, ask = +m.a;
-        return {mid: (bid + ask) / 2, bid, ask, t: m.u};
-    }
-    if (m.mid !== undefined) return m;                       // local feed-server shape
-    return null;
-}
-
-class OrderBook {
-    constructor() {
-        this.bidPx = new Float32Array(LVL);
-        this.bidSz = new Float32Array(LVL);
-        this.askPx = new Float32Array(LVL);
-        this.askSz = new Float32Array(LVL);
-        this.mid = 0;
-    }
-
-    apply(t) {                                    // SEAM: real book deltas off the wire
-        this.mid = t.mid;
-        for (let i = 0; i < LVL; i++) {
-            this.bidPx[i] = t.bid - i * 0.5;
-            this.askPx[i] = t.ask + i * 0.5;
-            this.bidSz[i] = 4 + Math.abs(Math.sin(t.mid * 0.03 + i)) * 40;
-            this.askSz[i] = 4 + Math.abs(Math.cos(t.mid * 0.021 + i)) * 40;
-        }
-    }
-}
 
 // A FEW aggregates via lite-di-signal (a scoped registry wired into container teardown).
 class Aggregates {
@@ -99,7 +73,7 @@ const SIM_HALF_SPREAD = 0.75;      // synthetic half-spread (USD)
 const SIM_MAX_BURST = 8;           // cap ticks per poll so a stalled tab cannot spiral
 
 function makeSimSocket(emit) {
-    const tick = {mid: 60000, bid: 60000, ask: 60000, t: 0};
+    const tick = {tag: TAG_QUOTE, bid: 60000, ask: 60000, mid: 60000, t: 0};
     let last = performance.now(), acc = 0, seq = 0;
     return {
         status() {
@@ -149,24 +123,18 @@ class Feed {
     }
 }
 
-// event-bus listeners: DI-constructed, fan each decoded tick out at 0 B/emit.
-class BookApply {
-    constructor(book) {
-        this.book = book;
-    }
-
-    handle(t) {
-        this.book.apply(t);
-    }
-}
-
+// event-bus listeners: DI-constructed, fan each decoded frame out at 0 B/emit.
+// TapeApply/AggApply are tag-agnostic -- both QUOTE and DEPTH frames carry
+// mid/bid/ask scalars, so no tag branch leaks into a hot handler body. (The book
+// itself is applied in the cold onMessage switch, where the DEPTH-vs-QUOTE choice
+// lives.) TradeApply pushes into two scalar rings, never an object ring.
 class TapeApply {
     constructor(tape) {
         this.tape = tape;
     }
 
-    handle(t) {
-        this.tape.push(t.mid);
+    handle(f) {
+        this.tape.push(f.mid);
     }
 }
 
@@ -175,8 +143,20 @@ class AggApply {
         this.agg = agg;
     }
 
-    handle(t) {
-        this.agg.apply(t);
+    handle(f) {
+        this.agg.apply(f);
+    }
+}
+
+class TradeApply {
+    constructor(px, side) {
+        this.px = px;
+        this.side = side;
+    }
+
+    handle(f) {
+        this.px.push(f.px);
+        this.side.push(f.maker ? -1 : 1);
     }
 }
 
@@ -259,7 +239,7 @@ class LabelCache {
     }
 }
 
-function drawFrame(ctx, w, h, book, scratch, n, labels) {
+function drawFrame(ctx, w, h, book, scratch, n, labels, tradePx, tradeSide, nTrades) {
     ctx.clearRect(0, 0, w, h);
     ctx.strokeStyle = 'rgba(120,135,155,0.10)';
     ctx.lineWidth = 1;
@@ -303,15 +283,29 @@ function drawFrame(ctx, w, h, book, scratch, n, labels) {
         ctx.shadowColor = '#4EE7D2';
         ctx.shadowBlur = 12;
         ctx.beginPath();
-        ctx.arc(plotW, ly, 3.5, 0, Math.PI * 2);
+        ctx.arc(plotW, ly, 3.5, 0, TAU);
         ctx.fill();
         ctx.shadowBlur = 0;
     }
 
-    const ladderX = plotW + 24, ladderW = w - ladderX - 16, midY = h / 2, rowH = (h * 0.9) / (LVL * 2);
-    for (let i = 0; i < LVL; i++) {
-        const aw = Math.min(ladderW, book.askSz[i] * (ladderW / 48));
-        const bw = Math.min(ladderW, book.bidSz[i] * (ladderW / 48));
+    // recent trades as buy/sell dots, mapped through the same lo/span as the trace
+    if (nTrades > 0 && n > 0) {
+        const denomT = (nTrades - 1) || 1;
+        for (let i = 0; i < nTrades; i++) {
+            const tx = (i / denomT) * plotW;
+            const ty = h - ((tradePx[i] - lo) / span) * (h - 24) - 12;
+            ctx.fillStyle = tradeSide[i] > 0 ? DOT_BUY : DOT_SELL;
+            ctx.beginPath();
+            ctx.arc(tx, ty, 2.5, 0, TAU);
+            ctx.fill();
+        }
+    }
+
+    const ladderX = plotW + 24, ladderW = w - ladderX - 16, midY = h / 2, rowH = (h * 0.9) / (MAXLVL * 2);
+    const scale = ladderW / (book.maxSz || 1);
+    for (let i = 0; i < book.n; i++) {
+        const aw = Math.min(ladderW, book.askSz[i] * scale);
+        const bw = Math.min(ladderW, book.bidSz[i] * scale);
         const ay = midY - (i + 1) * rowH, by = midY + i * rowH;
         ctx.fillStyle = 'rgba(245,166,35,0.55)';
         ctx.fillRect(ladderX, ay, aw, rowH - 2);
@@ -332,18 +326,18 @@ class CoarseRenderer {
     }
 
     draw(v, book, s, n) {
-        drawFrame(v.ctx, v.w, v.h, book, s, n, null);
+        drawFrame(v.ctx, v.w, v.h, book, s, n, null, v.tradePx, v.tradeSide, v.nTrades);
     }
 }
 
 class DetailedRenderer {
     constructor() {
         this.mode = '2d';
-        this.labels = {ask: new LabelCache(LVL), bid: new LabelCache(LVL)};
+        this.labels = {ask: new LabelCache(MAXLVL), bid: new LabelCache(MAXLVL)};
     }
 
     draw(v, book, s, n) {
-        drawFrame(v.ctx, v.w, v.h, book, s, n, this.labels);
+        drawFrame(v.ctx, v.w, v.h, book, s, n, this.labels, v.tradePx, v.tradeSide, v.nTrades);
     }
 }
 
@@ -353,8 +347,8 @@ class DetailedRenderer {
 class GLRenderer {
     constructor() {
         this.mode = 'gl';
-        this.pts = new Float32Array(RING * 8);
-        this.quads = new Float32Array(LVL * 2 * 9);
+        this.pts = new Float32Array((RING + TRADE_RING) * 8);
+        this.quads = new Float32Array(MAXLVL * 2 * 9);
     }
 
     draw(v, book, scratch, n) {
@@ -374,9 +368,10 @@ class GLRenderer {
         if (qsink) {
             qsink.resize(w, h);
             const q = this.quads, ladderX = plotW + 24 * dpr, ladderW = w - ladderX - 16 * dpr,
-                midY = h / 2, rowH = (h * 0.9) / (LVL * 2), barH = rowH - 2 * dpr, scale = ladderW / 48;
+                midY = h / 2, rowH = (h * 0.9) / (MAXLVL * 2), barH = rowH - 2 * dpr,
+                scale = ladderW / (book.maxSz || 1), nb = book.n;
             let k = 0;
-            for (let i = 0; i < LVL; i++) {
+            for (let i = 0; i < nb; i++) {
                 const aw = Math.min(ladderW, book.askSz[i] * scale), ay = midY - (i + 1) * rowH;
                 q[k++] = ladderX + aw / 2;
                 q[k++] = ay + rowH / 2;
@@ -398,11 +393,11 @@ class GLRenderer {
                 q[k++] = 0.82;
                 q[k++] = 0.6;                      // bid teal
             }
-            qsink.upload(q, 0, LVL * 2 * 9, 0, 9);
-            qsink.draw(LVL * 2);
+            qsink.upload(q, 0, nb * 2 * 9, 0, 9);
+            qsink.draw(nb * 2);
         }
 
-        // -- tick ring as GL_POINTS (on top) --
+        // -- tick ring + recent trades as GL_POINTS (on top), one buffer, one draw --
         if (n > 0) {
             let lo = Infinity, hi = -Infinity;
             for (let i = 0; i < n; i++) {
@@ -427,19 +422,34 @@ class GLRenderer {
                 d[b + 6] = 1.0;
                 d[b + 7] = 0;
             }
-            sink.upload(d, 0, n * 8, 0, 8);
-            sink.draw(n);
+            const nt = v.nTrades, tp = v.tradePx, ts = v.tradeSide, base = n * 8,
+                denomT = (nt - 1) || 1, tpSize = 5 * dpr;
+            for (let i = 0; i < nt; i++) {
+                const b = base + i * 8, buy = ts[i] > 0;
+                d[b] = (i / denomT) * plotW;
+                d[b + 1] = h - ((tp[i] - lo) / span) * usableH - botPad;
+                d[b + 2] = tpSize;
+                d[b + 3] = buy ? 0.306 : 0.96;
+                d[b + 4] = buy ? 0.906 : 0.65;
+                d[b + 5] = buy ? 0.82 : 0.14;
+                d[b + 6] = 1.0;
+                d[b + 7] = 0;
+            }
+            sink.upload(d, 0, (n + nt) * 8, 0, 8);
+            sink.draw(n + nt);
         }
     }
 }
 
 // ticker system: pulls the socket once per frame, then selects + draws.
 class RenderSystem {
-    constructor(viz, book, tape, agg) {
+    constructor(viz, book, tape, agg, tradePx, tradeSide) {
         this.viz = viz;
         this.book = book;
         this.tape = tape;
         this.agg = agg;
+        this.tradePx = tradePx;
+        this.tradeSide = tradeSide;
     }
 
     update() {
@@ -448,6 +458,10 @@ class RenderSystem {
         if (v.feedPoll) v.feedPoll();                       // lite-ws: wake once per frame
         const n = this.tape.count;
         this.tape.copyTo(v.scratch, 0);   // ring -> scratch (oldest-first)
+        const nt = this.tradePx.count;
+        this.tradePx.copyTo(v.tradePx, 0);                  // scalar rings -> preallocated views
+        this.tradeSide.copyTo(v.tradeSide, 0);
+        v.nTrades = nt;
         const r = v.router.resolve(v.zoom);                 // lite-di-strategies selects the renderer
         if (v.setMode) v.setMode(r.mode);                   // toggle 2d <-> gl canvas
         r.draw(v, this.book, v.scratch, n);
@@ -457,13 +471,14 @@ class RenderSystem {
 export async function bootKernel({ctx, gl, w, h, dpr, onEvent, onMode}) {
     const log = (kind, msg) => onEvent && onEvent(kind, msg);
     const viz = {
-        ctx, w, h, dpr: dpr || 1, zoom: 1, router: null, scratch: new Float32Array(RING), feedPoll: null,
-        glSink: null, glQuadSink: null, setMode: onMode || null
+        ctx, w, h, dpr: dpr || 1, zoom: 1, router: null, scratch: new Float32Array(RING),
+        tradePx: new Float32Array(TRADE_RING), tradeSide: new Float32Array(TRADE_RING), nTrades: 0,
+        feedPoll: null, glSink: null, glQuadSink: null, setMode: onMode || null
     };
     try {                                                                        // lite-gl WebGL2 sinks
         if (gl) {
-            viz.glSink = createPointSink(gl, {capacity: RING});
-            viz.glQuadSink = createQuadSink(gl, {capacity: LVL * 2});
+            viz.glSink = createPointSink(gl, {capacity: RING + TRADE_RING});
+            viz.glQuadSink = createQuadSink(gl, {capacity: MAXLVL * 2});
         }
     } catch (e) {
         log('down', 'WebGL2 unavailable -- GPU renderer disabled');
@@ -476,15 +491,21 @@ export async function bootKernel({ctx, gl, w, h, dpr, onEvent, onMode}) {
     const agg = new Aggregates(rx);
     c.value('agg', agg);
     c.value('tape', new RingBuffer(RING));                    // lite-ring-buffer (pow2, bitmask wrap)
+    c.value('trades:px', new RingBuffer(TRADE_RING));         // recent-trade price ring (scalars)
+    c.value('trades:side', new RingBuffer(TRADE_RING));       // recent-trade side ring (+1 buy / -1 sell)
     c.singleton('book', OrderBook);
     c.value('renderer:coarse', new CoarseRenderer());
     c.value('renderer:detailed', new DetailedRenderer());
     c.value('renderer:gpu', new GLRenderer());               // lite-gl instanced points + quads
 
     // event-bus fan-out (boot-locked topology). The OBJECT bus is NOT recorded: its
-    // handlers consume each tick synchronously, so S2 may reuse per-tag scratch freely.
+    // handlers consume each frame synchronously, so S2 may reuse per-tag scratch freely.
+    // 'tick' carries QUOTE/DEPTH frames (tape + aggregates); 'trade' carries aggTrade
+    // frames into the two scalar rings. The book itself is applied in the cold dispatch
+    // switch below, where the DEPTH-vs-QUOTE choice lives -- never in a hot handler.
     const bus = new EventBus(c);
-    bus.on('tick', BookApply, ['book']).on('tick', TapeApply, ['tape']).on('tick', AggApply, ['agg']);
+    bus.on('tick', TapeApply, ['tape']).on('tick', AggApply, ['agg'])
+        .on('trade', TradeApply, ['trades:px', 'trades:side']);
 
     // Dedicated numeric flight-recorder. Carries mid SCALARS only -- an unboxed-double
     // payload array, so each capture is an inline store (no per-tick HeapNumber boxing) and
@@ -503,23 +524,42 @@ export async function bootKernel({ctx, gl, w, h, dpr, onEvent, onMode}) {
     // lite-ws: bind lifecycle signals to the SAME scoped registry, then dial the feed.
     // onMessage is the per-message pipe (0 B/emit fan-out); status/latency stay coarse signals.
     const {createSocket} = createSocketFactory(rx.registry);
-    let tickCount = 0, feedUrl = FEED_URL;
-    // Single tick dispatch point. Both the wire path (parseTick -> emitTick) and the sim
-    // path (makeSimSocket -> emitTick) funnel through here: one object fan-out, one counter,
-    // one scalar recorded. S2's `trade` channel attaches here too.
-    const emitTick = (t) => {
-        bus.emit('tick', t);            // object fan-out (synchronous, unrecorded)
-        tickCount++;
-        traceBus.emit('mid', t.mid);    // scalar-only, recorded -> zero-GC honest replay
+    let quoteCount = 0, depthCount = 0, tradeCount = 0, feedUrl = FEED_URL, bookRef = null;
+    // Single frame dispatch point. This is the ONLY place the wire tag is inspected: the
+    // switch is the cold seam. DEPTH sets the REAL 20-level ladder; QUOTE only fabricates a
+    // ladder when the book is still synthetic (sim / local-quote), so a live bookTicker
+    // never clobbers a real depth ladder -- it just feeds the dense price trace. TRADE fans
+    // to the two scalar rings. Every downstream handler (tape/agg/trade) is tag-agnostic.
+    const dispatch = (f) => {
+        switch (f.tag) {
+            case TAG_DEPTH:
+                bookRef.applyDepth(f);
+                bus.emit('tick', f);            // tape + aggregates (synchronous, unrecorded)
+                traceBus.emit('mid', f.mid);    // scalar-only, recorded -> zero-GC honest replay
+                depthCount++;
+                break;
+            case TAG_QUOTE:
+                if (bookRef.synthetic) bookRef.applySynthQuote(f);
+                bus.emit('tick', f);
+                traceBus.emit('mid', f.mid);
+                quoteCount++;
+                break;
+            case TAG_TRADE:
+                bus.emit('trade', f);           // -> TradeApply -> two scalar rings
+                tradeCount++;
+                break;
+        }
     };
-    // Resolve sim vs wire ONCE, here. The hot body never sees the distinction.
+    // Resolve sim vs wire ONCE, here. The hot body never sees the distinction. The sim
+    // socket emits a QUOTE-tagged scratch; the wire socket decodes via parseFrame. Both
+    // funnel through dispatch, so the tag switch stays the single cold seam.
     const makeSocket = () => feedUrl.startsWith('sim://')
-        ? makeSimSocket(emitTick)
+        ? makeSimSocket(dispatch)
         : createSocket(feedUrl, {
             onMessage: (data) => {
                 try {
-                    const t = parseTick(data);
-                    if (t) emitTick(t);
+                    const f = parseFrame(data);
+                    if (f) dispatch(f);
                 } catch {
                 }
             },
@@ -548,7 +588,7 @@ export async function bootKernel({ctx, gl, w, h, dpr, onEvent, onMode}) {
 
     // render loop
     const ticker = new Ticker(c);
-    ticker.system('render', RenderSystem, {lane: 'normal', deps: ['viz', 'book', 'tape', 'agg']});
+    ticker.system('render', RenderSystem, {lane: 'normal', deps: ['viz', 'book', 'tape', 'agg', 'trades:px', 'trades:side']});
 
     // scheduled housekeeping
     const cron = new Cron(c, {tickMs: 1000});
@@ -573,13 +613,19 @@ export async function bootKernel({ctx, gl, w, h, dpr, onEvent, onMode}) {
     });
     health.watchSupervisor('supervisor', sup, LANES.READY);
 
-    // Shared degrade path: switch feedUrl, clear the ring (price scale differs), log, and
+    // Shared degrade path: switch feedUrl, clear the rings (price scale differs), log, and
     // fault the feed so the supervisor re-resolves a fresh socket. Used by BOTH a manual
-    // source switch and the failover watchdog -- one place holds tape.reset + reportFault.
+    // source switch and the failover watchdog -- one place holds the resets + reportFault.
+    // Switching TO sim re-arms the synthetic ladder so its QUOTE frames refabricate levels
+    // instead of freezing the last real depth.
     const degradeTo = (url, kind, msg) => {
+        const toSim = url.startsWith('sim://');
         feedUrl = url;
         try {
             c.get('tape').reset();
+            c.get('trades:px').reset();
+            c.get('trades:side').reset();
+            if (toSim) c.get('book').synthetic = true;
         } catch {
         }
         log(kind, msg);
@@ -602,6 +648,7 @@ export async function bootKernel({ctx, gl, w, h, dpr, onEvent, onMode}) {
     c.boot();
     bus.boot();
     traceBus.boot();
+    bookRef = c.get('book');                                  // resolve the book once for the cold dispatch
     await sup.start();                                        // resolves 'feed' -> opens the socket
     refreshFeed();                                            // cache the initial socket for the hot path
 
@@ -631,12 +678,15 @@ export async function bootKernel({ctx, gl, w, h, dpr, onEvent, onMode}) {
         nodeCount = 0;
     }
 
-    // tps sampler
-    let tps = 0, lastCount = 0;
+    // rate sampler: quotes+depth per second (qps) and trades per second (trps)
+    let qps = 0, trps = 0, lastQ = 0, lastT = 0;
     const tpsTimer = setInterval(() => {
-        tps = tickCount - lastCount;
-        lastCount = tickCount;
-        agg.tps.set(tps);
+        const q = quoteCount + depthCount;
+        qps = q - lastQ;
+        lastQ = q;
+        trps = tradeCount - lastT;
+        lastT = tradeCount;
+        agg.tps.set(qps);
     }, 1000);
 
     return {
@@ -653,7 +703,8 @@ export async function bootKernel({ctx, gl, w, h, dpr, onEvent, onMode}) {
                 }
             }
             return {
-                mid: agg.mid(), bid: agg.bid(), ask: agg.ask(), spread: agg.spread(), tps,
+                mid: agg.mid(), bid: agg.bid(), ask: agg.ask(), spread: agg.spread(), qps, trps,
+                levels: bookRef ? bookRef.n : 0, syntheticLadder: bookRef ? bookRef.synthetic : true,
                 readyz: health.readyz(), livez: health.livez(), supState: sup.state, restarts,
                 recorded: traceBus.recorded(), nodeCount, jobs: refs.stats,
                 status, latency, attempts, open,

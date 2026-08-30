@@ -3,7 +3,7 @@
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>market-map -- lite-di-* ingestion kernel (skeleton)</title>
+    <title>market-map -- lite-di-* ingestion kernel</title>
     <!--
       PINNED import map. Every entry carries an exact @x.y.z; a bare specifier would
       float to the CDN `latest` and break the demo silently on the next publish.
@@ -171,7 +171,7 @@
 
         h1 {
             font-size: 1.05rem;
-            margin: 2px 0 0;
+            margin: 0.125rem 0 0;
             letter-spacing: -.01em;
         }
 
@@ -181,7 +181,7 @@
             font-weight: 400;
             font-size: .74rem;
             font-family: var(--mono);
-            margin-top: 3px;
+            margin-top: 0.1875rem;
         }
 
         .group {
@@ -379,7 +379,7 @@
     <aside class="panel">
         <div>
             <p class="eyebrow">@zakkster/lite-di-*</p>
-            <h1>Ingestion kernel <small>skeleton demo &middot; real packages, in-browser</small></h1>
+            <h1>Ingestion kernel <small>real packages, in-browser</small></h1>
         </div>
 
         <div class="group">
@@ -389,7 +389,9 @@
                 <div class="row"><span class="k">bid</span><span class="v" id="bid">--</span></div>
                 <div class="row"><span class="k">ask</span><span class="v" id="ask">--</span></div>
                 <div class="row"><span class="k">spread</span><span class="v" id="spread">--</span></div>
-                <div class="row"><span class="k">ticks / sec</span><span class="v" id="tps">--</span></div>
+                <div class="row"><span class="k">quotes / s</span><span class="v" id="qps">--</span></div>
+                <div class="row"><span class="k">trades / s</span><span class="v" id="trps">--</span></div>
+                <div class="row"><span class="k">ladder</span><span class="v accent" id="ladder">--</span></div>
             </div>
         </div>
 
@@ -426,8 +428,8 @@
         <div class="controls">
             <div class="slider">feed
                 <select id="source">
-                    <option value="wss://stream.binance.com:9443/ws/btcusdt@bookTicker" selected>Binance BTCUSDT (live)</option>
-                    <option value="wss://stream.binance.com:9443/ws/ethusdt@bookTicker">Binance ETHUSDT (live)</option>
+                    <option value="wss://stream.binance.com:9443/stream?streams=btcusdt@depth20@100ms/btcusdt@aggTrade/btcusdt@bookTicker" selected>Binance BTCUSDT (live)</option>
+                    <option value="wss://stream.binance.com:9443/stream?streams=ethusdt@depth20@100ms/ethusdt@aggTrade/ethusdt@bookTicker">Binance ETHUSDT (live)</option>
                     <option value="sim://random-walk">simulation (in-page)</option>
                     <option value="ws://127.0.0.1:8100">local (feed-server)</option>
                 </select>
@@ -458,12 +460,13 @@
     const glc = document.getElementById('gl');
     const ctx = cv.getContext('2d');
     const gl = glc.getContext('webgl2', {antialias: true, alpha: true, premultipliedAlpha: false});
-    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    let dpr = Math.min(window.devicePixelRatio || 1, 2);
     const $ = (id) => document.getElementById(id);
 
     let W = 0, H = 0;
 
     function size() {
+        dpr = Math.min(window.devicePixelRatio || 1, 2);   // FRESH each cold pass: pick up a monitor-DPI change
         const r = cv.parentElement.getBoundingClientRect();
         W = Math.max(320, r.width);
         H = Math.max(240, r.height);
@@ -522,6 +525,16 @@
         }
         pushLog('heal', 'kernel booted -- ' + handle.readState().nodeCount + ' graph nodes wired');
 
+        // Cache every HUD + control node ONCE -- no handler or refresh re-runs getElementById.
+        const el = {
+            mid: $('mid'), bid: $('bid'), ask: $('ask'), spread: $('spread'),
+            qps: $('qps'), trps: $('trps'), ladder: $('ladder'), zoomv: $('zoomv'),
+            readyz: $('readyz'), livez: $('livez'), restarts: $('restarts'), supstate: $('supstate'),
+            nodes: $('nodes'), rec: $('rec'), aggs: $('aggs'), cronmisc: $('cronmisc'),
+            wsstatus: $('wsstatus'), latency: $('latency'), attempts: $('attempts'),
+            dFeed: $('d-feed'), dReady: $('d-ready'), dLive: $('d-live'), heal: $('heal'),
+        };
+
         window.addEventListener('resize', () => {
             const s = size();
             handle.resize(s.W, s.H, dpr);
@@ -530,20 +543,11 @@
         $('zoom').addEventListener('input', (e) => {
             const z = parseFloat(e.target.value);
             handle.setZoom(z);
-            $('zoomv').textContent = z.toFixed(1) + 'x';
+            el.zoomv.textContent = z.toFixed(1) + 'x';   // cached node -- no lookup on every drag frame
         });
         $('kill').addEventListener('click', () => handle.killFeed());
         $('replay').addEventListener('click', () => handle.replay());
         $('source').addEventListener('change', (e) => handle.setSource(e.target.value));
-
-        // Cache every HUD node ONCE -- the refresh loop must not re-run getElementById.
-        const el = {
-            mid: $('mid'), bid: $('bid'), ask: $('ask'), spread: $('spread'), tps: $('tps'),
-            readyz: $('readyz'), livez: $('livez'), restarts: $('restarts'), supstate: $('supstate'),
-            nodes: $('nodes'), rec: $('rec'), aggs: $('aggs'), cronmisc: $('cronmisc'),
-            wsstatus: $('wsstatus'), latency: $('latency'), attempts: $('attempts'),
-            dFeed: $('d-feed'), dReady: $('d-ready'), dLive: $('d-live'), heal: $('heal'),
-        };
 
         // HUD refresh (decoupled from the render loop; cached refs, no per-tick lookups)
         setInterval(() => {
@@ -552,7 +556,9 @@
             el.bid.textContent = fmt(s.bid);
             el.ask.textContent = fmt(s.ask);
             el.spread.textContent = fmt(s.spread);
-            el.tps.textContent = s.tps;
+            el.qps.textContent = s.qps;
+            el.trps.textContent = s.trps;
+            el.ladder.textContent = s.syntheticLadder ? 'SYNTH' : 'WIRE (' + s.levels + ' lvl)';
             el.readyz.textContent = s.readyz;
             el.livez.textContent = s.livez;
             el.restarts.textContent = s.restarts;
