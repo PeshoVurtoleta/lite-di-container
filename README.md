@@ -431,6 +431,11 @@ only the bricks a given service needs.
 
 <p align="center"><sub>The kernel at a glance. An interactive version lives in <a href="diEcosystem/index.html"><code>diEcosystem/index.html</code></a>.</sub></p>
 
+<p align="center">
+  <a href="https://github.com/PeshoVurtoleta/lite-di-container/actions/workflows/ci.yml"><img src="https://github.com/PeshoVurtoleta/lite-di-container/actions/workflows/ci.yml/badge.svg" alt="CI: the market-map demo boots the real kernel headless under node:test, with leak + alloc + break-gate jobs gating the Pages deploy."></a>
+</p>
+<p align="center"><sub>CI proves the <a href="diEcosystem/market-map/"><code>market-map</code></a> demo headless: node:test on 20/22/24, a lite-leak torture + alloc gates, and an inverted break-gate (an armed canary that exits 0 turns CI red). The Pages deploy is gated on all three.</sub></p>
+
 ### The layers
 
 Each tier sits on the container and does exactly one job the tier below does not.

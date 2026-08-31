@@ -1,0 +1,82 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  pages: write
+  id-token: write
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node: [20, 22, 24]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - run: npm ci
+        working-directory: diEcosystem/market-map
+      - run: npm test
+        working-directory: diEcosystem/market-map
+
+  leak:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci
+        working-directory: diEcosystem/market-map
+      - run: npm run torture
+        working-directory: diEcosystem/market-map
+      - run: npm run alloc
+        working-directory: diEcosystem/market-map
+      - run: npm run churn
+        working-directory: diEcosystem/market-map
+
+  break-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci
+        working-directory: diEcosystem/market-map
+      # The canary MUST break: an armed torture that exits 0 means the retention gate
+      # stopped detecting leaks -- fail CI so a dead gate never ships green.
+      - name: armed torture must exit non-zero
+        working-directory: diEcosystem/market-map
+        run: |
+          if TORTURE_LEAK=1 npm run torture; then
+            echo "break control did not break"; exit 1
+          fi
+
+  deploy:
+    needs: [test, leak, break-gate]
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    # Only the Pages deploy serializes; the test gates must never cancel each other.
+    concurrency:
+      group: pages
+      cancel-in-progress: true
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: .
+      - id: deployment
+        uses: actions/deploy-pages@v4
