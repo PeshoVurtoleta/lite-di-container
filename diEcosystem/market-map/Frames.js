@@ -96,7 +96,13 @@ export class OrderBook {
         const bids = f.bids, asks = f.asks, n = f.n, wasSynth = this.synthetic;
         let frameMax = 0, bc = 0, ac = 0, cmax = 0;
         for (let i = 0; i < n; i++) {
-            const bs = +bids[i][1], as = +asks[i][1];
+            let bs = +bids[i][1], as = +asks[i][1];
+            // Fail closed on a non-finite wire size (NaN/+-Infinity from a
+            // malformed payload): treat it as 0 so it poisons neither its own
+            // level nor the running cumulative sum. `x - x` is 0 for any finite
+            // x and NaN for NaN/+-Inf -- a zero-alloc, branch-cheap finite test.
+            if (bs - bs !== 0) bs = 0;
+            if (as - as !== 0) as = 0;
             this.bidPx[i] = +bids[i][0];
             this.bidSz[i] = bs;
             this.askPx[i] = +asks[i][0];

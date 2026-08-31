@@ -193,28 +193,57 @@ test('applyDepth ADVERSARIAL: -0 sizes -- maxCum floors to +1e-9 (never -0, neve
     assert.ok(!Object.is(book.maxCum, 0) || book.maxCum === 1e-9);
 });
 
-// ---- adversarial: NaN-poisoned level (contagion into the cum accumulator) -
+// ---- fail-closed: NaN-poisoned level no longer contaminates the cum tail ---
 
-test('applyDepth ADVERSARIAL: a NaN size at level 0 poisons bidCum from that index onward, but maxCum stays finite and floored (the one guarantee the PLAN actually makes)', () => {
+test('applyDepth: a NaN size fails closed to 0 -- it poisons NEITHER its own bidSz level NOR any downstream bidCum slot (no cumulative contagion)', () => {
+    // HARDENING (post-S4 fail-closed fix, Frames.js applyDepth): `bs - bs !== 0`
+    // rejects NaN/+-Infinity and substitutes 0 BEFORE the value reaches either
+    // bidSz[i] or the running accumulator `bc`. Regression guard: before the fix
+    // a single NaN at level 0 turned every bidCum slot NaN forever (`bc += NaN`
+    // stays NaN), a fail-open surface that conflicts with the house law "fail
+    // closed on every unverified state; null is not zero."
     const book = new OrderBook();
     const bidSizes = Array.from({length: MAXLVL}, (_, i) => (i === 0 ? 'not-a-number' : 1));
     const askSizes = new Array(MAXLVL).fill(1);
     book.applyDepth(frame(MAXLVL, bidSizes, askSizes));
 
-    // DOCUMENTED FINDING: unlike bidSz (which only carries the bad value at its
-    // own index), the CUMULATIVE accumulator is contagious -- one NaN poisons
-    // every bidCum slot from that index to the end of the applied range, because
-    // `bc += NaN` is NaN forever after. This is new surface area introduced by
-    // the cumulative-sum addition (bidSz/askSz had no such contagion pre-S4).
-    for (let i = 0; i < MAXLVL; i++) assert.ok(Number.isNaN(book.bidCum[i]), 'bidCum[' + i + '] should be NaN');
+    // The bad level itself is 0 (its size failed closed), not NaN.
+    assert.equal(book.bidSz[0], 0, 'poisoned level size must fail closed to 0');
+    assert.ok(!Number.isNaN(book.bidSz[0]));
 
-    // The one guarantee the PLAN's assertion actually states is about maxCum,
-    // not bidCum: `if (bc > cmax) cmax = bc` is false for any NaN bc (NaN
-    // comparisons are always false), so cmax never latches a NaN -- maxCum stays
-    // whatever finite value the OTHER (unpoisoned) side produced, floored.
-    assert.ok(!Number.isNaN(book.maxCum), 'maxCum must never be NaN even under a poisoned side');
+    // The cumulative tail is CLEAN: bidCum is the running sum with the bad level
+    // counted as 0. Level 0 contributes 0, then each subsequent level adds 1, so
+    // bidCum[i] == i (0,1,2,...). No slot is NaN -- the contagion is gone.
+    for (let i = 0; i < MAXLVL; i++) {
+        assert.ok(!Number.isNaN(book.bidCum[i]), 'bidCum[' + i + '] must not be NaN');
+        assert.equal(book.bidCum[i], Math.fround(i), 'bidCum[' + i + '] == running sum with bad level as 0');
+    }
+
+    // The unpoisoned ask side is unchanged, and maxCum stays finite + floored.
+    assert.equal(book.askCum[MAXLVL - 1], Math.fround(MAXLVL));
+    assert.ok(!Number.isNaN(book.maxCum), 'maxCum must never be NaN');
     assert.ok(book.maxCum >= 1e-9);
-    assert.equal(book.maxCum, Math.fround(MAXLVL)); // askCum[19] = 20 * 1, the unpoisoned side
+    assert.equal(book.maxCum, Math.fround(MAXLVL)); // askCum[19] = 20 * 1, the surviving side
+});
+
+// ---- fail-closed: +-Infinity size also fails closed (not just NaN) ---------
+
+test('applyDepth: an Infinity size fails closed to 0 -- bidCum stays finite (no Inf/NaN leak into the curve or maxCum)', () => {
+    const book = new OrderBook();
+    // A raw 'Infinity' string parses to +Infinity via unary +; a huge overflow
+    // literal ('1e400') also coerces to Infinity. Both must fail closed.
+    const bidSizes = Array.from({length: MAXLVL}, (_, i) => (i === 5 ? 'Infinity' : (i === 10 ? '1e400' : 2)));
+    const askSizes = new Array(MAXLVL).fill(2);
+    book.applyDepth(frame(MAXLVL, bidSizes, askSizes));
+
+    assert.equal(book.bidSz[5], 0, 'Infinity level fails closed to 0');
+    assert.equal(book.bidSz[10], 0, '1e400 overflow level fails closed to 0');
+    for (let i = 0; i < MAXLVL; i++) {
+        assert.ok(Number.isFinite(book.bidCum[i]), 'bidCum[' + i + '] must stay finite');
+    }
+    // Two levels dropped to 0, the other 18 carry 2 each: final cum == 18 * 2.
+    assert.equal(book.bidCum[MAXLVL - 1], Math.fround((MAXLVL - 2) * 2));
+    assert.ok(Number.isFinite(book.maxCum) && book.maxCum > 0);
 });
 
 // ---- null / undefined frame: fail LOUD on contract violation, by design ---
