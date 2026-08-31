@@ -23,11 +23,54 @@ import {createSignalScope, SIGNAL_REGISTRY_TOKEN} from '@zakkster/lite-di-signal
 import {createRegistry} from '@zakkster/lite-signal';
 import {createSocketFactory} from '@zakkster/lite-ws';
 import {RingBuffer} from '@zakkster/lite-ring-buffer';
-import {createPointSink, createQuadSink} from '@zakkster/lite-gl/backend';
+import {createPointSink, createQuadSink, createLineSink} from '@zakkster/lite-gl/backend';
 import {TAG_QUOTE, TAG_DEPTH, TAG_TRADE, MAXLVL, parseFrame, OrderBook} from './Frames.js';
 
-const RING = 2048;                 // SEAM: size to your firehose window
+// Ring sizing is a BOOT parameter, not a constant. RingBuffer's contract is a
+// power-of-two capacity; pickRing() feature-detects the device class and returns a
+// pow2 in [RING_MIN, RING_MAX]. Fail closed: navigator.deviceMemory is Chromium-only
+// (absent on iOS Safari), so an absent value assumes the smaller tier and is logged.
+const RING_MAX = 65536;            // SEAM: max firehose window (pow2)
+const RING_MIN = 4096;             // degraded floor (pow2)
+const RECORD_FRAMES = 2048;        // trace recorder window -- DECOUPLED from tape size:
+                                   // 65536 recorded frames is a separate memory budget.
+const DEPTH_QUADS = MAXLVL * 2;    // S4 Phase D: one cumulative-depth quad per level per side
 const TRADE_RING = 256;            // recent-trade window (pow2, scalar rings)
+const LINE_STRIDE = 9;             // lite-gl LAYOUT.LINE: (x0,y0,x1,y1,width,r,g,b,a) per segment
+// GL trade-dot colors, hoisted to module scope so the hot vertex loop carries no literals.
+const BUY_R = 0.306, BUY_G = 0.906, BUY_B = 0.82;   // taker-buy dot (teal)
+const SELL_R = 0.96, SELL_G = 0.65, SELL_B = 0.14;  // taker-sell dot (ember)
+// GL cumulative-depth quad colors (translucent, drawn behind the ladder bars).
+const DEPTH_ASK_R = 0.96, DEPTH_ASK_G = 0.65, DEPTH_ASK_B = 0.14, DEPTH_A = 0.18;
+const DEPTH_BID_R = 0.306, DEPTH_BID_G = 0.906, DEPTH_BID_B = 0.82;
+// 2D cumulative-depth curve fills (hex-first per demo CSS law is inline-only; canvas takes rgba).
+const CURVE_BID = 'rgba(78,231,210,0.12)';
+const CURVE_ASK = 'rgba(245,166,35,0.12)';
+
+// Snap n to a power of two within [RING_MIN, RING_MAX]. Fail closed on a bad override.
+function clampRing(n) {
+    let r = n | 0;
+    if (r < RING_MIN) r = RING_MIN;
+    if (r > RING_MAX) r = RING_MAX;
+    let p = RING_MIN;
+    while (p * 2 <= r) p *= 2;      // snap DOWN to a pow2 (RingBuffer contract)
+    return p;
+}
+
+// Device-class ring pick. undefined deviceMemory -> smaller tier (fail closed, logged
+// to the dev console). Returns a power of two clamped to [RING_MIN, RING_MAX].
+function pickRing() {
+    const nav = typeof navigator !== 'undefined' ? navigator : null;
+    const mem = nav && typeof nav.deviceMemory === 'number' ? nav.deviceMemory : undefined;
+    const cores = nav && typeof nav.hardwareConcurrency === 'number' ? nav.hardwareConcurrency : 0;
+    if (mem === undefined) {
+        console.warn('pickRing: navigator.deviceMemory unavailable -- assuming smaller tier (ring ' + RING_MIN + ')');
+        return RING_MIN;
+    }
+    let ring = mem >= 8 ? RING_MAX : (mem >= 4 ? 16384 : RING_MIN);
+    if (mem >= 4 && cores >= 8 && ring < RING_MAX) ring *= 2;   // many cores nudge one tier
+    return clampRing(ring);
+}
 const POLL_MS = 100;               // per-scope background-ingest poll cadence (G1)
 const TAU = Math.PI * 2;
 const DOT_BUY = '#4EE7D2';         // taker-buy trade dot (teal)
@@ -348,6 +391,26 @@ function drawFrame(ctx, w, h, book, scratch, n, labels, tradePx, tradeSide, nTra
     }
 
     const ladderX = plotW + 24, ladderW = w - ladderX - 16, midY = h / 2, rowH = (h * 0.9) / (MAXLVL * 2);
+    // cumulative-depth curve BEHIND the bars: one filled sweep per side, scaled by maxCum.
+    const cmax = book.maxCum || 1, nb = book.n;
+    ctx.fillStyle = CURVE_BID;
+    ctx.beginPath();
+    ctx.moveTo(ladderX, midY);
+    for (let i = 0; i < nb; i++) {
+        ctx.lineTo(ladderX + (book.bidCum[i] / cmax) * ladderW, midY + i * rowH + rowH / 2);
+    }
+    ctx.lineTo(ladderX, midY + nb * rowH);
+    ctx.closePath();
+    ctx.fill();
+    ctx.fillStyle = CURVE_ASK;
+    ctx.beginPath();
+    ctx.moveTo(ladderX, midY);
+    for (let i = 0; i < nb; i++) {
+        ctx.lineTo(ladderX + (book.askCum[i] / cmax) * ladderW, midY - (i + 1) * rowH + rowH / 2);
+    }
+    ctx.lineTo(ladderX, midY - nb * rowH);
+    ctx.closePath();
+    ctx.fill();
     const scale = ladderW / (book.maxSz || 1);
     for (let i = 0; i < book.n; i++) {
         const aw = Math.min(ladderW, book.askSz[i] * scale);
@@ -391,14 +454,19 @@ class DetailedRenderer {
 // ladder as instanced QUAD bars (stride 9: x,y=center, w,h, rot, r,g,b,a). Screen pixels,
 // top-left origin. The path that scales to ~1M primitives; here both sinks compose per frame.
 class GLRenderer {
-    constructor() {
+    constructor(cap) {
         this.mode = 'gl';
-        this.pts = new Float32Array((RING + TRADE_RING) * 8);
-        this.quads = new Float32Array(MAXLVL * 2 * 9);
-        // Trace point size + palette as instance fields, read (never allocated) in the
-        // hot body -- so a rebind() to GLRendererV2 swaps the visible build in one frame.
+        // Primary trace = a LINE polyline (cap-1 segments). this.pts survives ONLY as the
+        // fail-closed point-cloud fallback (trace + trades) when the line sink is absent.
+        this.line = new Float32Array((cap - 1) * LINE_STRIDE);
+        this.tradePts = new Float32Array(TRADE_RING * 8);   // trade dots (second point draw)
+        this.pts = new Float32Array((cap + TRADE_RING) * 8);
+        this.quads = new Float32Array((MAXLVL * 2 + DEPTH_QUADS) * 9);
+        // Trace size + palette as instance fields, read (never allocated) in the hot
+        // body -- so a rebind() to GLRendererV2 swaps the visible build in one frame.
         this.ptSize = 3.5;
         this.tpSize = 5;
+        this.lineW = 2;
         this.cr = 0.306;
         this.cg = 0.906;
         this.cb = 0.82;
@@ -416,14 +484,38 @@ class GLRenderer {
         gl.enable(gl.BLEND);
         gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);   // translucent bars
 
-        // -- depth ladder as QUAD bars --
+        // -- cumulative depth curve (behind) + depth ladder bars (on top): ONE buffer, ONE draw --
         const qsink = v.glQuadSink;
         if (qsink) {
             qsink.resize(w, h);
             const q = this.quads, ladderX = plotW + 24 * dpr, ladderW = w - ladderX - 16 * dpr,
                 midY = h / 2, rowH = (h * 0.9) / (MAXLVL * 2), barH = rowH - 2 * dpr,
-                scale = ladderW / (book.maxSz || 1), nb = book.n;
+                scale = ladderW / (book.maxSz || 1), cmax = book.maxCum || 1, nb = book.n;
             let k = 0;
+            // depth curve FIRST (earlier instances draw behind): one translucent quad per side.
+            for (let i = 0; i < nb; i++) {
+                const acw = (book.askCum[i] / cmax) * ladderW, acy = midY - (i + 1) * rowH;
+                q[k++] = ladderX + acw / 2;
+                q[k++] = acy + rowH / 2;
+                q[k++] = acw;
+                q[k++] = barH;
+                q[k++] = 0;
+                q[k++] = DEPTH_ASK_R;
+                q[k++] = DEPTH_ASK_G;
+                q[k++] = DEPTH_ASK_B;
+                q[k++] = DEPTH_A;                  // ask cumulative (faint amber)
+                const bcw = (book.bidCum[i] / cmax) * ladderW, bcy = midY + i * rowH;
+                q[k++] = ladderX + bcw / 2;
+                q[k++] = bcy + rowH / 2;
+                q[k++] = bcw;
+                q[k++] = barH;
+                q[k++] = 0;
+                q[k++] = DEPTH_BID_R;
+                q[k++] = DEPTH_BID_G;
+                q[k++] = DEPTH_BID_B;
+                q[k++] = DEPTH_A;                  // bid cumulative (faint teal)
+            }
+            // ladder bars ON TOP.
             for (let i = 0; i < nb; i++) {
                 const aw = Math.min(ladderW, book.askSz[i] * scale), ay = midY - (i + 1) * rowH;
                 q[k++] = ladderX + aw / 2;
@@ -446,11 +538,14 @@ class GLRenderer {
                 q[k++] = 0.82;
                 q[k++] = 0.6;                      // bid teal
             }
-            qsink.upload(q, 0, nb * 2 * 9, 0, 9);
-            qsink.draw(nb * 2);
+            const count = nb * 4;                  // nb*2 depth quads + nb*2 bar quads
+            qsink.upload(q, 0, count * 9, 0, 9);
+            qsink.draw(count);
         }
 
-        // -- tick ring + recent trades as GL_POINTS (on top), one buffer, one draw --
+        // -- price trace as a thick LINE polyline (primary) + trade dots as GL_POINTS --
+        // A missing line sink (fail-closed degrade flag v.glLineSink === null) falls back to
+        // the original single point cloud (trace + trades), so the GPU path never throws.
         if (n > 0) {
             let lo = Infinity, hi = -Infinity;
             for (let i = 0; i < n; i++) {
@@ -462,34 +557,87 @@ class GLRenderer {
                 lo = 0;
                 hi = 1;
             }
-            const span = (hi - lo) || 1, d = this.pts, cr = this.cr, cg = this.cg, cb = this.cb,
-                usableH = h - 24 * dpr, botPad = 12 * dpr, ptSize = this.ptSize * dpr, denom = (n - 1 || 1);
-            for (let i = 0; i < n; i++) {
-                const b = i * 8;
-                d[b] = (i / denom) * plotW;
-                d[b + 1] = h - ((scratch[i] - lo) / span) * usableH - botPad;
-                d[b + 2] = ptSize;
-                d[b + 3] = cr;
-                d[b + 4] = cg;
-                d[b + 5] = cb;
-                d[b + 6] = 1.0;
-                d[b + 7] = 0;
+            const span = (hi - lo) || 1, cr = this.cr, cg = this.cg, cb = this.cb,
+                usableH = h - 24 * dpr, botPad = 12 * dpr, denom = (n - 1 || 1),
+                nt = v.nTrades, tp = v.tradePx, ts = v.tradeSide,
+                tpSize = this.tpSize * dpr, denomT = (nt - 1) || 1, lineSink = v.glLineSink;
+            // S4 Phase B timer (temporary, flag-gated): S2 = the interleaved vertex build.
+            const mm = v.measure, mt0 = mm ? performance.now() : 0;
+            if (lineSink) {
+                // S2a: line segments (i -> segment i-1); carry the previous point, no re-map.
+                const L = this.line, lw = this.lineW * dpr;
+                let px = 0, py = h - ((scratch[0] - lo) / span) * usableH - botPad;
+                for (let i = 1; i < n; i++) {
+                    const cx = (i / denom) * plotW;
+                    const cy = h - ((scratch[i] - lo) / span) * usableH - botPad;
+                    const b = (i - 1) * 9;
+                    L[b] = px;
+                    L[b + 1] = py;
+                    L[b + 2] = cx;
+                    L[b + 3] = cy;
+                    L[b + 4] = lw;
+                    L[b + 5] = cr;
+                    L[b + 6] = cg;
+                    L[b + 7] = cb;
+                    L[b + 8] = 1.0;
+                    px = cx;
+                    py = cy;
+                }
+                // S2b: trade dots into the dedicated trade-point buffer.
+                const d = this.tradePts;
+                for (let i = 0; i < nt; i++) {
+                    const b = i * 8, buy = ts[i] > 0;
+                    d[b] = (i / denomT) * plotW;
+                    d[b + 1] = h - ((tp[i] - lo) / span) * usableH - botPad;
+                    d[b + 2] = tpSize;
+                    d[b + 3] = buy ? BUY_R : SELL_R;
+                    d[b + 4] = buy ? BUY_G : SELL_G;
+                    d[b + 5] = buy ? BUY_B : SELL_B;
+                    d[b + 6] = 1.0;
+                    d[b + 7] = 0;
+                }
+                if (mm) v.mS2[v.mHead] = performance.now() - mt0;
+                // S3 = upload + draw: LINE (trace) then POINTS (trades) -- 2 of the 3 GL draws.
+                const mt1 = mm ? performance.now() : 0;
+                const segs = n - 1;
+                if (segs > 0) {
+                    lineSink.upload(L, 0, segs * 9, 0, 9);
+                    lineSink.draw(segs);
+                }
+                sink.upload(d, 0, nt * 8, 0, 8);
+                sink.draw(nt);
+                if (mm) v.mS3[v.mHead] = performance.now() - mt1;
+            } else {
+                // fail-closed fallback: no line sink -> the original point cloud (trace + trades).
+                const d = this.pts, ptSize = this.ptSize * dpr, base = n * 8;
+                for (let i = 0; i < n; i++) {
+                    const b = i * 8;
+                    d[b] = (i / denom) * plotW;
+                    d[b + 1] = h - ((scratch[i] - lo) / span) * usableH - botPad;
+                    d[b + 2] = ptSize;
+                    d[b + 3] = cr;
+                    d[b + 4] = cg;
+                    d[b + 5] = cb;
+                    d[b + 6] = 1.0;
+                    d[b + 7] = 0;
+                }
+                for (let i = 0; i < nt; i++) {
+                    const b = base + i * 8, buy = ts[i] > 0;
+                    d[b] = (i / denomT) * plotW;
+                    d[b + 1] = h - ((tp[i] - lo) / span) * usableH - botPad;
+                    d[b + 2] = tpSize;
+                    d[b + 3] = buy ? BUY_R : SELL_R;
+                    d[b + 4] = buy ? BUY_G : SELL_G;
+                    d[b + 5] = buy ? BUY_B : SELL_B;
+                    d[b + 6] = 1.0;
+                    d[b + 7] = 0;
+                }
+                if (mm) v.mS2[v.mHead] = performance.now() - mt0;
+                const mt1 = mm ? performance.now() : 0;
+                sink.upload(d, 0, (n + nt) * 8, 0, 8);
+                sink.draw(n + nt);
+                if (mm) v.mS3[v.mHead] = performance.now() - mt1;
             }
-            const nt = v.nTrades, tp = v.tradePx, ts = v.tradeSide, base = n * 8,
-                denomT = (nt - 1) || 1, tpSize = this.tpSize * dpr;
-            for (let i = 0; i < nt; i++) {
-                const b = base + i * 8, buy = ts[i] > 0;
-                d[b] = (i / denomT) * plotW;
-                d[b + 1] = h - ((tp[i] - lo) / span) * usableH - botPad;
-                d[b + 2] = tpSize;
-                d[b + 3] = buy ? 0.306 : 0.96;
-                d[b + 4] = buy ? 0.906 : 0.65;
-                d[b + 5] = buy ? 0.82 : 0.14;
-                d[b + 6] = 1.0;
-                d[b + 7] = 0;
-            }
-            sink.upload(d, 0, (n + nt) * 8, 0, 8);
-            sink.draw(n + nt);
         }
     }
 }
@@ -500,10 +648,11 @@ class GLRenderer {
 // A VALUE (no GL resources of its own; it draws through the shared parent sink), so
 // the un-torn-down old instance is harmless (owner risk 6).
 class GLRendererV2 extends GLRenderer {
-    constructor() {
-        super();
+    constructor(cap) {
+        super(cap);
         this.ptSize = 6;
         this.tpSize = 8;
+        this.lineW = 4;
         this.cr = 0.96;
         this.cg = 0.65;
         this.cb = 0.14;
@@ -514,6 +663,18 @@ class GLRendererV2 extends GLRenderer {
 // draws. deps ['viz'] ONLY -- the per-symbol book/tape/agg/feed live behind the single
 // pre-allocated `viz.active` holder, mutated on tab switch (cold). No c.get, no literal,
 // no closure in this body; a background symbol's ingest is pumped by its own PollJob.
+// S4 Phase B (temporary, S5 hands these to the perf panel): compute p50/p99 over the
+// filled samples of one 600-slot stage ring and print at 1 Hz. NOT a hot path -- called
+// once per ~60 frames; the subarray view + toFixed are fine at that cadence.
+function reportStage(label, ring, count, sortBuf) {
+    if (count === 0) return;
+    for (let i = 0; i < count; i++) sortBuf[i] = ring[i];
+    const view = sortBuf.subarray(0, count);
+    view.sort();
+    const p50 = view[(count * 0.5) | 0], p99 = view[(count * 0.99) | 0];
+    console.log('measure ' + label + ' p50=' + p50.toFixed(3) + 'ms p99=' + p99.toFixed(3) + 'ms n=' + count);
+}
+
 class RenderSystem {
     constructor(viz) {
         this.viz = viz;
@@ -526,14 +687,29 @@ class RenderSystem {
         if (!a) return;                                     // no live symbol -> idle
         a.feedPoll();                                       // active scope: wake its socket
         const n = a.tape.count;
-        a.tape.copyTo(v.scratch, 0);                        // ring -> scratch (oldest-first)
+        // S4 Phase B timer (temporary, flag-gated by v.measure; off = only these bytes).
+        const mm = v.measure, mt0 = mm ? performance.now() : 0;
+        a.tape.copyTo(v.scratch, 0);                        // ring -> scratch (oldest-first) = S1
+        if (mm) v.mS1[v.mHead] = performance.now() - mt0;
         const nt = a.tradePx.count;
         a.tradePx.copyTo(v.tradePx, 0);                     // scalar rings -> preallocated views
         a.tradeSide.copyTo(v.tradeSide, 0);
         v.nTrades = nt;
         const r = v.router.resolve(v.zoom);                 // lite-di-strategies selects the renderer
         if (v.setMode) v.setMode(r.mode);                   // toggle 2d <-> gl canvas
-        r.draw(v, a.book, v.scratch, n);
+        r.draw(v, a.book, v.scratch, n);                    // GLRenderer.draw writes S2/S3 at v.mHead
+        if (mm) {
+            let h = v.mHead + 1;
+            if (h >= 600) h = 0;                            // 600 is not pow2 -> compare, not mask
+            v.mHead = h;
+            if (v.mCount < 600) v.mCount++;
+            if (++v.mFrame >= 60) {                         // ~1 Hz report (frame-counter throttle)
+                v.mFrame = 0;
+                reportStage('S1-copy', v.mS1, v.mCount, v.mSort);
+                reportStage('S2-build', v.mS2, v.mCount, v.mSort);
+                reportStage('S3-upload', v.mS3, v.mCount, v.mSort);
+            }
+        }
     }
 }
 
@@ -548,7 +724,7 @@ function rxOf(sc) {
 // its OWN supervisor/health so killing one feed faults ONE scope. The registry is
 // created via createSignalScope (eager -> _resolutionOrder[0]) so it tears down LAST.
 // Cold factory: everything here runs once, at tab open, never per frame.
-function createSymbolScope(parent, {symbol, url, log, faulty}) {
+function createSymbolScope(parent, {symbol, url, log, faulty, ringSize}) {
     const s = createSignalScope(parent, {createRegistry});   // registry pinned first, torn down last
     const scopeReg = s.get(SIGNAL_REGISTRY_TOKEN);
 
@@ -557,7 +733,7 @@ function createSymbolScope(parent, {symbol, url, log, faulty}) {
     // resolution order and never torn down or counted. Anything that must appear in
     // the teardown walk is a singleton.
     s.value('symbol', symbol);
-    s.singletonFactory('tape', () => new RingBuffer(RING));
+    s.singletonFactory('tape', () => new RingBuffer(ringSize));
     s.singleton('book', OrderBook);
     s.singletonFactory('agg', (sc) => new Aggregates(rxOf(sc)));
     s.singletonFactory('trades:px', () => new RingBuffer(TRADE_RING));
@@ -751,7 +927,7 @@ function createSymbolScope(parent, {symbol, url, log, faulty}) {
         async start() {
             await sup.start();                               // resolves 'feed' -> opens the socket
             refreshFeed();
-            traceBus.record(RING, {onOverflow: 'drop-oldest'});
+            traceBus.record(RECORD_FRAMES, {onOverflow: 'drop-oldest'});   // decoupled from tape size (task 3)
             scron.start();
         },
         state() {
@@ -816,24 +992,52 @@ function createSymbolScope(parent, {symbol, url, log, faulty}) {
     };
 }
 
-export async function bootKernel({ctx, gl, w, h, dpr, onEvent, onMode}) {
+export async function bootKernel({ctx, gl, w, h, dpr, onEvent, onMode, ringSize}) {
     const log = (kind, msg) => onEvent && onEvent(kind, msg);
     // ?faultyTeardown read ONCE, cold, at boot (never on the hot path).
-    const faulty = typeof location !== 'undefined'
-        && new URLSearchParams(location.search).has('faultyTeardown');
+    const params = typeof location !== 'undefined' ? new URLSearchParams(location.search) : null;
+    const faulty = !!(params && params.has('faultyTeardown'));
+
+    // Ring size, resolved ONCE at boot: explicit {ringSize} option wins; else the
+    // ?ring=N URL override (the measurement hook -- boot at ?ring=65536); else pickRing()
+    // by device class. clampRing keeps every source a pow2 in [RING_MIN, RING_MAX].
+    let ring = ringSize;
+    if (ring === undefined && params && params.has('ring')) {
+        const r = parseInt(params.get('ring'), 10);
+        if (Number.isFinite(r) && r > 0) ring = r;
+    }
+    ring = clampRing(ring === undefined ? pickRing() : ring);
+    if (ring < RING_MAX) {
+        const nav = typeof navigator !== 'undefined' ? navigator : null;
+        const memD = nav && typeof nav.deviceMemory === 'number' ? nav.deviceMemory : 'unknown';
+        log('degrade', 'degrade: ring ' + RING_MAX + ' -> ' + ring + ' (deviceMemory=' + memD + ')');
+    }
 
     const viz = {
-        ctx, w, h, dpr: dpr || 1, zoom: 1, router: null, active: null, scratch: new Float32Array(RING),
+        ctx, w, h, dpr: dpr || 1, zoom: 1, router: null, active: null, scratch: new Float32Array(ring),
         tradePx: new Float32Array(TRADE_RING), tradeSide: new Float32Array(TRADE_RING), nTrades: 0,
-        glSink: null, glQuadSink: null, setMode: onMode || null,
+        glSink: null, glQuadSink: null, glLineSink: null, setMode: onMode || null,
+        // S4 Phase B: flag-gated three-stage timer state (preallocated; see reportStage).
+        measure: false, mHead: 0, mCount: 0, mFrame: 0,
+        mS1: new Float64Array(600), mS2: new Float64Array(600), mS3: new Float64Array(600),
+        mSort: new Float64Array(600),
     };
     try {                                                                        // lite-gl WebGL2 sinks (shared, risk 5)
         if (gl) {
-            viz.glSink = createPointSink(gl, {capacity: RING + TRADE_RING});
-            viz.glQuadSink = createQuadSink(gl, {capacity: MAXLVL * 2});
+            viz.glSink = createPointSink(gl, {capacity: ring + TRADE_RING});
+            viz.glQuadSink = createQuadSink(gl, {capacity: MAXLVL * 2 + DEPTH_QUADS});
         }
     } catch (e) {
         log('down', 'WebGL2 unavailable -- GPU renderer disabled');
+    }
+    // The LINE sink is a SEPARATE fail-closed stage (Path A: full ring, ring-1 segments).
+    // If it fails while the point sink lives, GLRenderer.draw sees v.glLineSink === null and
+    // degrades the trace to the point cloud -- it must degrade, never throw.
+    try {
+        if (gl && viz.glSink) viz.glLineSink = createLineSink(gl, {capacity: ring - 1});
+    } catch (e) {
+        viz.glLineSink = null;
+        log('down', 'lite-gl LINE sink unavailable -- price trace degraded to point cloud');
     }
 
     // The single pre-allocated active-symbol holder. Mutated on tab switch (cold);
@@ -846,7 +1050,7 @@ export async function bootKernel({ctx, gl, w, h, dpr, onEvent, onMode}) {
     c.value('stats', stats);
     c.value('renderer:coarse', new CoarseRenderer());
     c.value('renderer:detailed', new DetailedRenderer());
-    c.value('renderer:gpu', new GLRenderer());                  // rebind target -- a VALUE (risk 6)
+    c.value('renderer:gpu', new GLRenderer(ring));              // rebind target -- a VALUE (risk 6)
 
     const ticker = new Ticker(c);
     ticker.system('render', RenderSystem, {lane: 'normal', deps: ['viz']});      // deps: viz ONLY (hot)
@@ -917,7 +1121,7 @@ export async function bootKernel({ctx, gl, w, h, dpr, onEvent, onMode}) {
             setActive(sym);
             return scopes.get(sym);
         }
-        const h = createSymbolScope(c, {symbol: sym, url: u, log, faulty});
+        const h = createSymbolScope(c, {symbol: sym, url: u, log, faulty, ringSize: ring});
         await h.start();
         scopes.set(sym, h);
         recomputeNodes();
@@ -938,7 +1142,7 @@ export async function bootKernel({ctx, gl, w, h, dpr, onEvent, onMode}) {
     // rebind hot-swap (GAP-3): renderer:gpu is a VALUE; invalidate() is a no-op for a
     // value so the swap is instant and the router needs no reconfiguration.
     const swapRenderer = async () => {
-        await c.rebind('renderer:gpu', {type: TYPES.VALUE, value: new GLRendererV2(), isAsync: false});
+        await c.rebind('renderer:gpu', {type: TYPES.VALUE, value: new GLRendererV2(ring), isAsync: false});
         gpuV2 = true;
         log('rebind', 'rebind: renderer:gpu -> v2 (post-boot hot-swap, GAP-3)');
         if (viz.zoom < 2.2) log('rebind', 'rebind: zoom is ' + viz.zoom.toFixed(1) + 'x -- raise zoom >= 2.2x to see the gpu build');
@@ -989,6 +1193,15 @@ export async function bootKernel({ctx, gl, w, h, dpr, onEvent, onMode}) {
         setZoom(z) {
             viz.zoom = z;
         },
+        // S4 Phase B measurement hook. From the console: `handle.measure(true)` (boot at
+        // ?ring=65536 first) starts the three-stage timer; p50/p99 print to console at 1 Hz.
+        measure(on) {
+            viz.measure = !!on;
+            viz.mHead = 0;
+            viz.mCount = 0;
+            viz.mFrame = 0;
+        },
+        ringSize: ring,
         setSource(u) {
             const h = active();
             if (h) h.setSource(u);

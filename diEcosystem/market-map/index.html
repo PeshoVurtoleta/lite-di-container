@@ -121,6 +121,8 @@
             width: 100%;
             height: 100%;
             display: block;
+            touch-action: none;   /* pinch/drag stay as pointer events; scoped to the canvas so
+                                     the HUD/panel keep native scroll on a phone (plan risk 4) */
         }
 
         .stage canvas.hidden {
@@ -246,6 +248,7 @@
             letter-spacing: .14em;
             text-transform: uppercase;
             color: var(--accent);
+            pointer-events: none;                    /* overlay label -- never intercept a pinch */
         }
 
         .heal-banner {
@@ -557,7 +560,7 @@
                     <option value="ws://127.0.0.1:8100">local (feed-server)</option>
                 </select>
             </div>
-            <div class="slider">zoom <input type="range" id="zoom" min="0.5" max="3" step="0.1" value="1"><span
+            <div class="slider">zoom (or pinch) <input type="range" id="zoom" min="0.5" max="3" step="0.1" value="1"><span
                     id="zoomv" class="v">1.0x</span></div>
             <button id="kill" class="danger">Kill feed &rarr; watch it self-heal</button>
             <button id="replay">Replay recorded session (event-bus)</button>
@@ -593,18 +596,55 @@
     let handle = null;
     let W = 0, H = 0;
     let curMode = '2d';
+    const wrap = cv.parentElement;
+
+    // Anti-reflow seam (task 20): the canvas-wrap rect, CACHED here at size()/resize.
+    // The pointermove HOT path reads these fields -- it MUST NOT call getBoundingClientRect.
+    // Mutate the fields in place; never reassign this object.
+    const stageRect = {left: 0, top: 0, width: 0, height: 0};
+
+    // Fixed two-slot pointer table (task 21), allocated ONCE. ids: -1 = empty slot.
+    // xy: slot0 = [0],[1]; slot1 = [2],[3]. No Map, no per-event object -- pointerdown
+    // claims a free slot, pointermove updates the matching slot, pointerup/cancel/out
+    // releases by id. Everything downstream is a scalar read of these two typed arrays.
+    const ptrId = new Int32Array(2).fill(-1);
+    const ptrXY = new Float64Array(4);
+    let pinchStartDist = 0;      // 0 = not currently pinching (recaptured on the 2-finger transition)
+    let pinchBaseZoom = 1;
+    let curZoom = 1;             // live zoom mirror -> pinch reads this, never parseFloat in the hot body
+    let zoomQ = 10;             // last DOM-written quantized zoom ((z*10)|0); init matches "1.0x"
 
     function size() {
         dpr = Math.min(window.devicePixelRatio || 1, 2);   // FRESH each cold pass: pick up a monitor-DPI change
-        const r = cv.parentElement.getBoundingClientRect();
+        const r = wrap.getBoundingClientRect();
         W = Math.max(320, r.width);
         H = Math.max(240, r.height);
+        stageRect.left = r.left;                             // cache for the pointer HOT path (task 20)
+        stageRect.top = r.top;
+        stageRect.width = r.width;
+        stageRect.height = r.height;
         cv.width = W * dpr;
         cv.height = H * dpr;
         ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
         glc.width = W * dpr;      // GL backing store is device px; kernel draws in device px
         glc.height = H * dpr;
         return {W, H};
+    }
+
+    // Single source of truth for zoom (task 23): both the slider input and the pinch
+    // gesture call THIS. Clamp to the slider bounds [0.5, 3], push to the kernel, mirror
+    // the slider position, and write the label ONLY when its 0.1-quantized value changes
+    // -- so a 120 Hz pinch does not touch the DOM 120x/s (also closes audit finding 13).
+    function applyZoom(z) {
+        if (z < 0.5) z = 0.5; else if (z > 3) z = 3;
+        curZoom = z;
+        if (handle) handle.setZoom(z);
+        el.zoom.value = z;
+        const q = (z * 10) | 0;
+        if (q !== zoomQ) {
+            zoomQ = q;
+            el.zoomv.textContent = z.toFixed(1) + 'x';
+        }
     }
 
     // toggle which canvas is visible when strategies swaps the renderer (deduped);
@@ -817,10 +857,52 @@
         if (handle) handle.resize(s.W, s.H, dpr);
     });
     el.zoom.addEventListener('input', (e) => {
-        const z = parseFloat(e.target.value);
-        el.zoomv.textContent = z.toFixed(1) + 'x';   // cached node -- no lookup per drag frame
-        if (handle) handle.setZoom(z);
+        applyZoom(parseFloat(e.target.value));       // slider + pinch share ONE apply (task 23)
     });
+
+    // Pinch-to-zoom (Phase F). Handlers installed ONCE; all state is the module-level
+    // two-slot table + scalars. pointermove is HOT (up to 120 Hz) -- zero allocation:
+    // no object/array literals, no closures, no getBoundingClientRect (reads stageRect).
+    wrap.addEventListener('pointerdown', (e) => {
+        let slot = -1;
+        if (ptrId[0] === e.pointerId) slot = 0;
+        else if (ptrId[1] === e.pointerId) slot = 1;
+        else if (ptrId[0] === -1) slot = 0;
+        else if (ptrId[1] === -1) slot = 1;
+        if (slot === -1) return;                     // both slots busy -> ignore a 3rd finger
+        ptrId[slot] = e.pointerId;
+        ptrXY[slot * 2] = e.clientX - stageRect.left;
+        ptrXY[slot * 2 + 1] = e.clientY - stageRect.top;
+        // Capture on the wrap (parent of both canvases) so a 2d<->gl band crossing
+        // mid-pinch cannot drop the gesture when the active canvas is toggled hidden.
+        try { wrap.setPointerCapture(e.pointerId); } catch (_) {}
+    });
+    wrap.addEventListener('pointermove', (e) => {    // [HOT]
+        let slot = -1;
+        if (ptrId[0] === e.pointerId) slot = 0;
+        else if (ptrId[1] === e.pointerId) slot = 1;
+        if (slot === -1) return;
+        ptrXY[slot * 2] = e.clientX - stageRect.left;
+        ptrXY[slot * 2 + 1] = e.clientY - stageRect.top;
+        if (ptrId[0] === -1 || ptrId[1] === -1) return;   // need both fingers down to pinch
+        const dx = ptrXY[2] - ptrXY[0], dy = ptrXY[3] - ptrXY[1];
+        const dist = Math.sqrt(dx * dx + dy * dy);
+        if (pinchStartDist === 0) {                  // transition to two-fingers-down: capture baseline
+            pinchStartDist = dist;
+            pinchBaseZoom = curZoom;
+            return;
+        }
+        applyZoom(pinchBaseZoom * (dist / pinchStartDist));
+    });
+    const releasePointer = (e) => {
+        if (ptrId[0] === e.pointerId) ptrId[0] = -1;
+        else if (ptrId[1] === e.pointerId) ptrId[1] = -1;
+        if (ptrId[0] === -1 || ptrId[1] === -1) pinchStartDist = 0;   // gesture ended -> recapture next time
+    };
+    wrap.addEventListener('pointerup', releasePointer);
+    wrap.addEventListener('pointercancel', releasePointer);
+    wrap.addEventListener('pointerout', releasePointer);
+    wrap.addEventListener('lostpointercapture', releasePointer);   // capture dropped -> free the slot
     el.kill.addEventListener('click', () => {
         if (handle) handle.killFeed();
     });

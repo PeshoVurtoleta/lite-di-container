@@ -79,6 +79,9 @@ export class OrderBook {
         this.bidSz = new Float32Array(MAXLVL);
         this.askPx = new Float32Array(MAXLVL);
         this.askSz = new Float32Array(MAXLVL);
+        this.bidCum = new Float32Array(MAXLVL);             // running cumulative depth (bids)
+        this.askCum = new Float32Array(MAXLVL);             // running cumulative depth (asks)
+        this.maxCum = 0;                                    // largest cumulative -> curve scale
         this.mid = 0;
         this.n = 0;
         this.synthetic = true;
@@ -91,7 +94,7 @@ export class OrderBook {
     // to the actual size distribution -- no hardcoded divisor, no per-frame jitter.
     applyDepth(f) {
         const bids = f.bids, asks = f.asks, n = f.n, wasSynth = this.synthetic;
-        let frameMax = 0;
+        let frameMax = 0, bc = 0, ac = 0, cmax = 0;
         for (let i = 0; i < n; i++) {
             const bs = +bids[i][1], as = +asks[i][1];
             this.bidPx[i] = +bids[i][0];
@@ -100,7 +103,14 @@ export class OrderBook {
             this.askSz[i] = as;
             if (bs > frameMax) frameMax = bs;
             if (as > frameMax) frameMax = as;
+            bc += bs;                                       // carry running cumulative depth
+            ac += as;
+            this.bidCum[i] = bc;
+            this.askCum[i] = ac;
+            if (bc > cmax) cmax = bc;
+            if (ac > cmax) cmax = ac;
         }
+        this.maxCum = cmax > 1e-9 ? cmax : 1e-9;
         this.mid = (this.bidPx[0] + this.askPx[0]) / 2;
         this.n = n;
         if (wasSynth) this.maxSz = frameMax > 1e-9 ? frameMax : 1e-9;
@@ -115,12 +125,22 @@ export class OrderBook {
     // ladder around a single best quote when no real depth is arriving.
     applySynthQuote(f) {
         this.mid = f.mid;
+        let bc = 0, ac = 0, cmax = 0;
         for (let i = 0; i < MAXLVL; i++) {
             this.bidPx[i] = f.bid - i * 0.5;
             this.askPx[i] = f.ask + i * 0.5;
-            this.bidSz[i] = 4 + Math.abs(Math.sin(f.mid * 0.03 + i)) * 40;
-            this.askSz[i] = 4 + Math.abs(Math.cos(f.mid * 0.021 + i)) * 40;
+            const bs = 4 + Math.abs(Math.sin(f.mid * 0.03 + i)) * 40;
+            const as = 4 + Math.abs(Math.cos(f.mid * 0.021 + i)) * 40;
+            this.bidSz[i] = bs;
+            this.askSz[i] = as;
+            bc += bs;                                       // carry running cumulative depth
+            ac += as;
+            this.bidCum[i] = bc;
+            this.askCum[i] = ac;
+            if (bc > cmax) cmax = bc;
+            if (ac > cmax) cmax = ac;
         }
+        this.maxCum = cmax > 1e-9 ? cmax : 1e-9;
         this.n = MAXLVL;
         this.synthetic = true;
         this.maxSz = 48;                                    // matches the synth size band (4..44)
