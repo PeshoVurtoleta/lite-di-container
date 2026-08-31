@@ -1,0 +1,33 @@
+{
+  "name": "@zakkster/market-map-demo",
+  "private": true,
+  "type": "module",
+  "description": "Unpublished demo of the @zakkster/lite-di-* service kernel. Not on npm; dependency versions are pinned to match index.html's import map exactly (the single source of truth).",
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "torture": "node --expose-gc test/torture.mjs",
+    "alloc": "node --expose-gc test/alloc-parse.mjs && node --expose-gc test/alloc-applydepth.mjs",
+    "churn": "node --expose-gc --test test/scope-churn.test.mjs",
+    "verify": "npm test && npm run torture && npm run alloc && npm run churn"
+  },
+  "dependencies": {
+    "@zakkster/lite-di-container": "2.2.0",
+    "@zakkster/lite-di-event-bus": "1.1.0",
+    "@zakkster/lite-di-strategies": "1.0.0",
+    "@zakkster/lite-di-cron": "1.0.0",
+    "@zakkster/lite-di-ticker": "1.0.0",
+    "@zakkster/lite-di-supervisor": "1.0.0",
+    "@zakkster/lite-di-health": "1.0.0",
+    "@zakkster/lite-di-graph": "1.0.0",
+    "@zakkster/lite-di-signal": "1.0.0",
+    "@zakkster/lite-raf": "1.2.0",
+    "@zakkster/lite-signal": "1.5.0",
+    "@zakkster/lite-ws": "1.0.0",
+    "@zakkster/lite-ring-buffer": "1.0.1",
+    "@zakkster/lite-gl": "2.0.0"
+  },
+  "devDependencies": {
+    "@zakkster/lite-gc-profiler": "^1.15.0",
+    "@zakkster/lite-leak": "^1.8.1"
+  }
+}

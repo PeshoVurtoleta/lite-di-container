@@ -1,5 +1,7 @@
 # market-map -- a `@zakkster/lite-di-*` skeleton demo
 
+[![CI](https://github.com/PeshoVurtoleta/lite-di-container/actions/workflows/ci.yml/badge.svg)](https://github.com/PeshoVurtoleta/lite-di-container/actions/workflows/ci.yml)
+
 A **skeleton**, not a product: a real-time market-data / telemetry ingestion kernel
 built from the actual `lite-di-*` packages, running **in the browser** with a thin
 Canvas2D order-book viz. It is the "hybrid" demo -- the headless kernel does the real

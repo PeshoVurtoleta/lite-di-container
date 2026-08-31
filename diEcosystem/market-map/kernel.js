@@ -23,8 +23,13 @@ import {createSignalScope, SIGNAL_REGISTRY_TOKEN} from '@zakkster/lite-di-signal
 import {createRegistry} from '@zakkster/lite-signal';
 import {createSocketFactory} from '@zakkster/lite-ws';
 import {RingBuffer} from '@zakkster/lite-ring-buffer';
-import {createPointSink, createQuadSink, createLineSink} from '@zakkster/lite-gl/backend';
 import {TAG_QUOTE, TAG_DEPTH, TAG_TRADE, MAXLVL, parseFrame, OrderBook} from './Frames.js';
+
+// lite-gl/backend is loaded COLD (not a static import) so bootKernel can run headless
+// under node:test, where WebGL is absent. The dynamic import is awaited once, only when
+// a real canvas (gl && ctx) is present; the returned namespace carries all three sink
+// factories. It is the default value of bootKernel's injectable {glSinks} param.
+async function defaultGlSinks() { return import('@zakkster/lite-gl/backend'); }
 
 // Ring sizing is a BOOT parameter, not a constant. RingBuffer's contract is a
 // power-of-two capacity; pickRing() feature-detects the device class and returns a
@@ -82,9 +87,6 @@ const POLL_MS = 100;               // per-scope background-ingest poll cadence (
 const TAU = Math.PI * 2;
 const DOT_BUY = '#4EE7D2';         // taker-buy trade dot (teal)
 const DOT_SELL = '#F5A623';        // taker-sell trade dot (ember)
-// Narrated reverse-teardown order for a scope close. The closed-line is built from
-// this list marked against the ACTUAL failed steps, so it never claims a step that threw.
-const TEARDOWN_ORDER = ['feed', 'agg', 'tape', 'book', 'signal-registry'];
 // Feed sources. Each live symbol is ONE combined Binance stream carrying three
 // channels: depth20@100ms (the REAL 20-level ladder), aggTrade (the trade tape),
 // and bookTicker (a dense best-quote for the price trace). `sim` is the in-page
@@ -854,9 +856,15 @@ function rxOf(sc) {
 // its OWN supervisor/health so killing one feed faults ONE scope. The registry is
 // created via createSignalScope (eager -> _resolutionOrder[0]) so it tears down LAST.
 // Cold factory: everything here runs once, at tab open, never per frame.
-function createSymbolScope(parent, {symbol, url, log, faulty, ringSize}) {
+function createSymbolScope(parent, {symbol, url, log, faulty, ringSize, socketFactory}) {
     const s = createSignalScope(parent, {createRegistry});   // registry pinned first, torn down last
     const scopeReg = s.get(SIGNAL_REGISTRY_TOKEN);
+
+    // OBSERVED teardown order (not a constant): each real disposable's onTeardown appends
+    // its name here AS THE CONTAINER FIRES IT, so the narrated walk reflects the true
+    // reverse-topological order. Reorder the resolves and this array reorders with them --
+    // that is what makes the S6 teardown gate able to go RED (a hardcoded order cannot).
+    const teardownWalk = [];
 
     // tape / book / agg / trade rings are singleton(Factory) -- NEVER value: a VALUE
     // returns before the isCached block (Container.js:237) so it is never in the
@@ -880,6 +888,7 @@ function createSymbolScope(parent, {symbol, url, log, faulty, ringSize}) {
         .on('trade', TradeApply, ['trades:px', 'trades:side']);
     s.singletonFactory('bus', () => bus);
     s.onTeardown('bus', (b) => {
+        teardownWalk.push('bus');
         try {
             b.dispose();
         } catch {
@@ -890,6 +899,7 @@ function createSymbolScope(parent, {symbol, url, log, faulty, ringSize}) {
     traceBus.on('mid', MidReplay, ['tape', 'replayCtl']);
     s.singletonFactory('traceBus', () => traceBus);
     s.onTeardown('traceBus', (b) => {
+        teardownWalk.push('traceBus');
         try {
             b.dispose();
         } catch {
@@ -935,7 +945,7 @@ function createSymbolScope(parent, {symbol, url, log, faulty, ringSize}) {
         dispatch(burstFrame);
     };
 
-    const {createSocket} = createSocketFactory(scopeReg);     // per-scope socket factory
+    const {createSocket} = socketFactory(scopeReg);           // per-scope socket factory (injectable: tests pass a fake)
     const makeSocket = () => feedUrl.startsWith('sim://')
         ? makeSimSocket(dispatch)
         : createSocket(feedUrl, {
@@ -951,6 +961,7 @@ function createSymbolScope(parent, {symbol, url, log, faulty, ringSize}) {
     s.value('makeSocket', makeSocket);
     s.singleton('feed', Feed, ['makeSocket']);
     s.onTeardown('feed', (fd) => {
+        teardownWalk.push('feed');
         sock = null;
         try {
             fd.dispose();
@@ -959,10 +970,17 @@ function createSymbolScope(parent, {symbol, url, log, faulty, ringSize}) {
     });
 
     // dev-only fault injection (?faultyTeardown): one scope binding throws on teardown;
-    // container isolation (D-12) still fires the siblings and routes the error.
+    // container isolation (D-12) still fires the siblings and routes the error. It still
+    // records itself in the observed walk (before throwing) so the narration is honest.
     if (faulty) s.onTeardown('book', () => {
+        teardownWalk.push('book');
         throw new Error('injected teardown fault (?faultyTeardown)');
     });
+
+    // Registry narration hook: appends 'signal-registry' when createSignalScope's pinned
+    // registry is torn down (LAST, reverse of its index-0 resolve). Narration only -- the
+    // registry's own destroy is wired by createSignalScope; this observes the fire.
+    s.onTeardown(SIGNAL_REGISTRY_TOKEN, () => teardownWalk.push('signal-registry'));
 
     const refreshFeed = () => {
         try {
@@ -1065,6 +1083,7 @@ function createSymbolScope(parent, {symbol, url, log, faulty, ringSize}) {
     return {
         symbol, scope: s, nodeCount,
         book, tape, agg, tradePx, tradeSide, feedPoll, inject,
+        sup,                                             // test seam (S6): heal.test.mjs reaches the per-scope supervisor to reportFault
         async start() {
             await sup.start();                               // resolves 'feed' -> opens the socket
             refreshFeed();
@@ -1113,6 +1132,8 @@ function createSymbolScope(parent, {symbol, url, log, faulty, ringSize}) {
         async close(outerOnTeardownError) {
             log('down', 'teardown: feed[' + symbol + ']');
             scron.stop();
+            teardownWalk.length = 0;                          // drop any 'feed' entries pushed by prior heals; s.shutdown() re-fires every hook fresh
+
             const regNodes = scopeReg.stats().activeNodes;   // read the live count BEFORE destroy
             // Capture which bindings actually threw so the closed-line reflects the real
             // outcome (?faultyTeardown makes 'book' throw); still route each error outward.
@@ -1122,9 +1143,11 @@ function createSymbolScope(parent, {symbol, url, log, faulty, ringSize}) {
                 if (outerOnTeardownError) outerOnTeardownError(err, name);
             };
             await s.shutdown({onTeardownError});             // reverse-topological, registry last
+            // Build the narration from the OBSERVED fire order (teardownWalk), not a
+            // constant: it reflects exactly what the container tore down, in order.
             let walk = '';
-            for (let i = 0; i < TEARDOWN_ORDER.length; i++) {
-                const step = TEARDOWN_ORDER[i];
+            for (let i = 0; i < teardownWalk.length; i++) {
+                const step = teardownWalk[i];
                 walk += (i ? ' -> ' : '') + step + (failed.indexOf(step) !== -1 ? ' (failed)' : '');
             }
             log('down', 'scope: ' + symbol + ' closed -- teardown: ' + walk);
@@ -1133,7 +1156,9 @@ function createSymbolScope(parent, {symbol, url, log, faulty, ringSize}) {
     };
 }
 
-export async function bootKernel({ctx, gl, w, h, dpr, onEvent, onMode, ringSize}) {
+// pure DI applied to the DI demo: the two host imports (the ws socket factory and the
+// lite-gl sink factories) are injectable so bootKernel runs headless under node:test.
+export async function bootKernel({ctx, gl, w, h, dpr, onEvent, onMode, ringSize, socketFactory = createSocketFactory, glSinks = defaultGlSinks}) {
     const bootAt = performance.now();                        // S5 uptime origin (re-captured on re-boot)
     const log = (kind, msg) => onEvent && onEvent(kind, msg);
     // ?faultyTeardown read ONCE, cold, at boot (never on the hot path).
@@ -1166,10 +1191,15 @@ export async function bootKernel({ctx, gl, w, h, dpr, onEvent, onMode, ringSize}
         // S5 burst control (read by BurstSystem in the pre lane; set by handle.burst).
         burstN: 0, burstActive: false,
     };
+    // GL sink factories are loaded COLD, and ONLY when a real canvas is present. Headless
+    // (ctx: null || gl: null) skips both the import and construction -- viz.glSink/glQuadSink/
+    // glLineSink stay null and RenderSystem.update() already returns on !v.ctx, so headless
+    // render is a no-op with NO new branch or flag in the hot body.
+    const glb = (gl && ctx) ? await glSinks() : null;
     try {                                                                        // lite-gl WebGL2 sinks (shared, risk 5)
-        if (gl) {
-            viz.glSink = createPointSink(gl, {capacity: ring + TRADE_RING});
-            viz.glQuadSink = createQuadSink(gl, {capacity: MAXLVL * 2 + DEPTH_QUADS});
+        if (glb) {
+            viz.glSink = glb.createPointSink(gl, {capacity: ring + TRADE_RING});
+            viz.glQuadSink = glb.createQuadSink(gl, {capacity: MAXLVL * 2 + DEPTH_QUADS});
         }
     } catch (e) {
         log('down', 'WebGL2 unavailable -- GPU renderer disabled');
@@ -1178,7 +1208,7 @@ export async function bootKernel({ctx, gl, w, h, dpr, onEvent, onMode, ringSize}
     // If it fails while the point sink lives, GLRenderer.draw sees v.glLineSink === null and
     // degrades the trace to the point cloud -- it must degrade, never throw.
     try {
-        if (gl && viz.glSink) viz.glLineSink = createLineSink(gl, {capacity: ring - 1});
+        if (glb && viz.glSink) viz.glLineSink = glb.createLineSink(gl, {capacity: ring - 1});
     } catch (e) {
         viz.glLineSink = null;
         log('down', 'lite-gl LINE sink unavailable -- price trace degraded to point cloud');
@@ -1303,7 +1333,7 @@ export async function bootKernel({ctx, gl, w, h, dpr, onEvent, onMode, ringSize}
             setActive(sym);
             return scopes.get(sym);
         }
-        const h = createSymbolScope(c, {symbol: sym, url: u, log, faulty, ringSize: ring});
+        const h = createSymbolScope(c, {symbol: sym, url: u, log, faulty, ringSize: ring, socketFactory});
         await h.start();
         scopes.set(sym, h);
         recomputeNodes();
@@ -1341,6 +1371,10 @@ export async function bootKernel({ctx, gl, w, h, dpr, onEvent, onMode, ringSize}
     const active = () => (activeSymbol !== null ? scopes.get(activeSymbol) : null);
 
     return {
+        // test seams. _scopes: S6 headless assertions reach a per-scope handle (and its
+        // supervisor) through it. _c: the parent container, RESERVED for the S8/S9 gates
+        // (plans/PLAN-S6.md:45); no S6 test consumes it yet.
+        _c: c, _scopes: scopes,
         readState() {
             const h = active();
             const base = {
