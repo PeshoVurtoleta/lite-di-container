@@ -431,6 +431,8 @@ only the bricks a given service needs.
 
 <p align="center"><sub>The kernel at a glance. An interactive version lives in <a href="diEcosystem/index.html"><code>diEcosystem/index.html</code></a>.</sub></p>
 
+<p align="center"><sub><b>Seen in production shape:</b> <a href="https://zakkster.github.io/LiteDiContainer/diEcosystem/market-map/">the live <code>market-map</code> demo</a> -- a self-healing, zero-GC market-data kernel running this whole ring in the browser -- source under <a href="diEcosystem/market-map/"><code>diEcosystem/market-map/</code></a>.</sub></p>
+
 <p align="center">
   <a href="https://github.com/PeshoVurtoleta/lite-di-container/actions/workflows/ci.yml"><img src="https://github.com/PeshoVurtoleta/lite-di-container/actions/workflows/ci.yml/badge.svg" alt="CI: the market-map demo boots the real kernel headless under node:test, with leak + alloc + break-gate jobs gating the Pages deploy."></a>
 </p>
@@ -551,8 +553,8 @@ Taglines are each package's own `llms.txt` positioning line.
 - [`lite-gc-profiler`](https://www.npmjs.com/package/@zakkster/lite-gc-profiler) -- allocation and GC budget gates (dev dep across the line)
 - **`@zakkster/lite-di-container`** -- this package (formerly unscoped `lite-di-container`, now deprecated)
 
-The ten sibling modules are published at `1.0.0-alpha.1` and are torture-green; their
-alpha-to-stable graduation is tracked in [`PROMOTION_LADDER.md`](./PROMOTION_LADDER.md).
+The ten sibling modules are published at `1.0.0` and are torture-green; their
+graduation history is tracked in [`PROMOTION_LADDER.md`](./PROMOTION_LADDER.md).
 
 ---
 

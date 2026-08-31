@@ -1,11 +1,72 @@
-# market-map -- a `@zakkster/lite-di-*` skeleton demo
+# market-map -- a `@zakkster/lite-di-*` browser demo
 
-[![CI](https://github.com/PeshoVurtoleta/lite-di-container/actions/workflows/ci.yml/badge.svg)](https://github.com/PeshoVurtoleta/lite-di-container/actions/workflows/ci.yml)
+> A self-healing, zero-GC market-data kernel that runs in the browser -- 15 zero-dependency single-file ESM packages, no bundler.
+
+**Live (nothing to install):** https://zakkster.github.io/LiteDiContainer/diEcosystem/market-map/
+
+<!-- Hero GIF (owner-manual capture, T1): a ~5s loop of the Kill-feed heal -- click
+     "Kill feed", the event log shows fault -> restart -> fresh socket, the restarts
+     counter ticks up, and the viz never blanks. <= 900 CSS px, <= 3 MB, 12-15 fps.
+     Drop the file at ./assets/kill-feed.gif and uncomment the block below:
+<p align="center"><img src="./assets/kill-feed.gif" alt="Kill feed: the supervisor faults the feed, tears down the dead lite-ws socket in reverse-topological order, and re-resolves a fresh one -- the restarts counter increments while the order book never blanks." width="900"></p>
+-->
+
+[![CI](https://github.com/PeshoVurtoleta/lite-di-container/actions/workflows/ci.yml/badge.svg)](https://github.com/PeshoVurtoleta/lite-di-container/actions/workflows/ci.yml) &middot; [Pages deploy](https://github.com/PeshoVurtoleta/lite-di-container/actions/workflows/ci.yml) &middot; MIT (c) Zahary Shinikchiev
+
+## The demo the ecosystem was missing
 
 A **skeleton**, not a product: a real-time market-data / telemetry ingestion kernel
 built from the actual `lite-di-*` packages, running **in the browser** with a thin
 Canvas2D order-book viz. It is the "hybrid" demo -- the headless kernel does the real
-work; the visualization is the `ticker`/render showcase on top.
+work; the visualization is the `ticker`/render showcase on top. An in-browser DI
+kernel is the honest test: a browser has no forgiving server GC budget -- you get
+~16.6 ms a frame or you drop it -- so a zero-GC claim either holds on screen or it
+does not.
+
+## What is on screen
+
+The flagship controls, each with the exact event-log line it emits:
+
+- **Symbol tabs (`scope()`)** -- open a symbol and the container spins up a child
+  scope with its own signal registry: `scope: BTCUSDT opened -- child scope + own
+  signal registry (N bindings)`.
+- **Kill feed -> watch it self-heal** -- the supervisor faults the feed and
+  re-resolves a fresh `lite-ws` socket: `BTCUSDT: feed re-resolved -- dialing a
+  fresh socket` (the `restarts` counter increments; the viewport never blanks).
+- **Swap renderer build (rebind, GAP-3)** -- a genuine post-boot binding
+  replacement, not a strategy selection: `rebind: renderer:gpu -> v2 (post-boot
+  hot-swap, GAP-3)`.
+- **Shutdown kernel** -- children drain first, then reverse-topological teardown:
+  `shutdown: kernel draining -- children first`, then per scope `scope: BTCUSDT
+  closed -- teardown: feed -> traceBus -> bus -> signal-registry`, then `shutdown:
+  complete -- N teardowns, clean`.
+- **Burst x100 (10s)** -- pumps 100 synthetic ticks per frame into the active
+  scope's real pipeline so you can watch `p99` hold flat under 100x throughput.
+
+## Architecture
+
+Every node below is a `lite-di-container` binding; the dashed edges are the
+resilience siblings that watch, heal, and schedule the hot path.
+
+```mermaid
+graph LR
+  subgraph hot["hot path (every node a container binding)"]
+    FEED["lite-ws feed"] --> RING["lite-ring-buffer"] --> BUS["lite-di-event-bus"]
+    BUS --> BOOK["OrderBook"]
+    BUS --> TAPE["trade tape"]
+    BUS --> AGG["aggregates -&gt; lite-di-signal"]
+    BOOK --> STRAT["lite-di-strategies"]
+    TAPE --> STRAT
+    AGG --> STRAT
+    STRAT --> REND["renderer: coarse / detailed / lite-gl GPU"]
+    TICK["lite-di-ticker"] --> REND
+  end
+  subgraph resilience["resilience (container bindings too)"]
+    SUP["lite-di-supervisor"] -.-> FEED
+    HEALTH["lite-di-health"] -.-> SUP
+    CRON["lite-di-cron"] -.-> AGG
+  end
+```
 
 ## Run it
 
@@ -41,20 +102,26 @@ pin-bump procedure).
 
 ## What each package does here
 
-| Package | Role in the demo |
-| --- | --- |
-| `lite-di-container` | the graph: scopes, values, singletons, boot-time validation (17 nodes) |
-| `lite-di-event-bus` | 0 B/emit fan-out of each decoded tick to book / tape / aggregate handlers; **records** the session for replay |
-| `lite-di-signal` | the reactive control surface -- a **handful** of aggregates (mid / bid / ask / spread), NOT one signal per tick |
-| `lite-di-ticker` | the rAF render loop driving the repaint |
-| `lite-di-strategies` | selects the renderer by zoom: coarse Canvas2D -> detailed Canvas2D (price labels) -> **lite-gl GPU** past 2.2x -- read-path, 0 B/op |
-| `lite-di-cron` | wall-clock housekeeping: rolling aggregation, stale-array prune, heartbeat ping |
-| `lite-di-supervisor` | watches the feed subsystem; on a fault it re-resolves a **fresh socket** without dropping the render loop |
-| `lite-di-health` | `readyz` / `livez` over the feed + supervisor |
-| `lite-di-graph` | exports the booted dependency graph (node count / a JSON profile) |
-| **`lite-ws`** | the **real WebSocket feed**: `onMessage` pipes each decoded frame to the bus (0-GC), while `status` / `latency` / `reconnectAttempts` stay coarse reactive signals; built-in reconnect + backoff. Selectable at runtime between a **live Binance combined stream** (default; `@depth20@100ms` + `@aggTrade` + `@bookTicker` over wss, no auth), an **in-page simulation** (synthetic random walk, the supervised failover), and the local `feed-server` |
-| **`lite-ring-buffer`** | the pow2, bitmask-wrap `Float32Array` tick ring -- the 0-GC hot data the firehose lands in |
-| **`lite-gl`** | instanced WebGL2 renderer: the tick cloud via `createPointSink` **and the depth ladder via `createQuadSink`** (the whole order book on the GPU); scales to ~1M primitives |
+One row per import-map entry in `index.html` (15 specifiers). The **Version** column
+is the exact CDN pin -- the import map is the single source of truth.
+
+| Package | Version | Role in the demo |
+| --- | --- | --- |
+| `lite-di-container` | 2.2.0 | the graph: scopes, values, singletons, boot-time validation (17 nodes) |
+| `lite-di-event-bus` | 1.1.0 | 0 B/emit fan-out of each decoded tick to book / tape / aggregate handlers; **records** the session for replay |
+| `lite-di-strategies` | 1.0.0 | selects the renderer by zoom: coarse Canvas2D -> detailed Canvas2D (price labels) -> **lite-gl GPU** past 2.2x -- read-path, 0 B/op |
+| `lite-di-cron` | 1.0.0 | wall-clock housekeeping: rolling aggregation, stale-array prune, heartbeat ping |
+| `lite-di-ticker` | 1.0.0 | the rAF render loop driving the repaint |
+| `lite-di-supervisor` | 1.0.0 | watches the feed subsystem; on a fault it re-resolves a **fresh socket** without dropping the render loop |
+| `lite-di-health` | 1.0.0 | `readyz` / `livez` over the feed + supervisor |
+| `lite-di-graph` | 1.0.0 | exports the booted dependency graph (node count / a JSON profile) |
+| `lite-di-signal` | 1.0.0 | the reactive control surface -- a **handful** of aggregates (mid / bid / ask / spread), NOT one signal per tick |
+| `lite-raf` | 1.2.0 | the `requestAnimationFrame` frame source under `lite-di-ticker` (fails closed with no global rAF) |
+| `lite-signal` | 1.5.0 | the underlying reactive cell primitive the aggregate signals are built on |
+| **`lite-ws`** | 1.0.0 | the **real WebSocket feed**: `onMessage` pipes each decoded frame to the bus (0-GC), while `status` / `latency` / `reconnectAttempts` stay coarse reactive signals; built-in reconnect + backoff. Selectable at runtime between a **live Binance combined stream** (default; `@depth20@100ms` + `@aggTrade` + `@bookTicker` over wss, no auth), an **in-page simulation** (synthetic random walk, the supervised failover), and the local `feed-server` |
+| **`lite-ring-buffer`** | 1.0.1 | the pow2, bitmask-wrap `Float32Array` tick ring -- the 0-GC hot data the firehose lands in |
+| **`lite-gl`** | 2.0.0 | instanced WebGL2 renderer: the tick cloud via `createPointSink` **and the depth ladder via `createQuadSink`** (the whole order book on the GPU); scales to ~1M primitives |
+| `lite-gl/backend` | 2.0.0 | the same package's headless-importable sink factories -- imported cold by the S6 `bootKernel` seam, never at module top level |
 
 The headline beat: click **Kill feed** -- the supervisor faults the feed subsystem, tears
 down the old `lite-ws` socket, and re-resolves a fresh one (restarts++, transport
@@ -78,6 +145,18 @@ miniature: self-healing, fail-closed, zero-GC steady state -- over a real socket
   the tick cloud, the trades and the order book (`lite-gl` point + quad sinks).
 - Grow `RING` toward `lite-gl`'s ~1M; offer the `graph` JSON (`toJSON`) as a downloadable
   performance profile; add a WebGL LINE sink for a thick price polyline.
+
+## Data provenance
+
+One row per selectable source, one column per layer. `real` = off the wire /
+a real socket; `synthetic` = fabricated in the exact Binance shape. Only the live
+Binance feed is real market data; the HUD labels every synthetic layer on screen.
+
+| Source | Transport | Top-of-book | Ladder | Trade tape |
+| --- | --- | --- | --- | --- |
+| `binance` (default) | real (wss) | real (`@bookTicker`) | real (`@depth20@100ms`) | real (`@aggTrade`) |
+| `local` (feed-server) | real (ws socket) | synthetic | synthetic (HUD reads `WIRE` -- real depth arrays, synthetic numbers) | synthetic |
+| `sim://random-walk` | synthetic (in-page) | synthetic | synthetic (HUD reads `SYNTH`) | synthetic |
 
 ## Honest caveats
 
@@ -131,3 +210,56 @@ and `Chrome-Trace` (`toChromeTrace`). Load the trace at **ui.perfetto.dev** or
 (`ts` = teardown rank, each edge a matched `s`/`f` flow pair) -- it visualizes the graph as
 a trace, **not** a wall-clock frame profile. The export covers the parent container only;
 each symbol tab is a separate child scope with its own graph.
+
+## Testing
+
+The demo is not proven by driving the page -- it is proven by booting the **real
+kernel headless** under `node:test`. S6 added a `bootKernel({ ctx: null,
+socketFactory, glSinks })` seam so the DI graph boots with a fake socket factory
+and cold GL sinks, then the suites assert heal, reverse-topological teardown
+order, and scope-churn leak-freedom (under `@zakkster/lite-leak`, `--expose-gc`).
+
+```bash
+npm test          # node:test boundary suites
+npm run torture   # lite-leak + lite-gc-profiler soak
+npm run alloc     # zero-alloc parse / apply-depth gates
+npm run churn     # 256 open/close cycles, size() must return to 0
+```
+
+CI runs these on node 20/22/24 and adds an **inverted break-gate**: an armed leak
+canary (`TORTURE_LEAK=1`) that exits 0 turns CI red, so the leak gate cannot rot
+into a tautology. The Pages deploy is gated on all three jobs.
+
+Coverage boundary: the on-screen GL draw path and the DevTools soak numbers are
+**not** in the headless suite -- the GL path rides `lite-gl`'s own smoke test, and
+the soak table above is filled from a manual owner protocol (see
+[`WHY-market-map.md`](./WHY-market-map.md), "Not measured").
+
+## Design notes and what was rejected
+
+- [`WHY-market-map.md`](./WHY-market-map.md) -- the measured decisions: the
+  RING = 65536 upload measurement, why the browser and not a Node service, why no
+  bundler.
+- [`REJECTED.md`](./REJECTED.md) -- the design ledger: one signal per tick,
+  hot-swap via strategies, Playwright E2E, direct ring upload, and the deferrals,
+  each with **Design / Rejected because / Chosen instead**.
+
+## What this is not
+
+Not a trading system. It carries no order entry, no position or risk state, and
+no strategy logic; the `local` and `sim` sources are synthetic and labelled as
+such on screen. It is a proof that a self-healing, zero-GC DI kernel composed
+from single-file ESM bricks holds up at real firehose rates in a browser -- the
+architecture and package composition, not the finance.
+
+## Ecosystem
+
+Part of [`@zakkster/lite-di-*`](../../README.md) -- a zero-dependency service
+kernel: the container plus ten capability siblings (graph, cron, ticker,
+event-bus, signal, strategies, lock, supervisor, health, orchestrator). This demo
+wires fifteen of them (plus `lite-ws`, `lite-ring-buffer`, `lite-raf`,
+`lite-signal`, `lite-gl`) into one running system.
+
+## License
+
+MIT (c) Zahary Shinikchiev &lt;shinikchiev@yahoo.com&gt;
