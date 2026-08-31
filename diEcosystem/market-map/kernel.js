@@ -11,7 +11,7 @@
 //   - lite-di-supervisor heals the feed subsystem (fresh socket) while the viewport stays live.
 // SEAM: markers show the productization points.
 
-import {Container} from '@zakkster/lite-di-container';
+import {Container, TYPES} from '@zakkster/lite-di-container';
 import {EventBus} from '@zakkster/lite-di-event-bus';
 import {StrategyRouter} from '@zakkster/lite-di-strategies';
 import {Cron, interval} from '@zakkster/lite-di-cron';
@@ -19,7 +19,7 @@ import {Ticker} from '@zakkster/lite-di-ticker';
 import {Supervisor, STRATEGIES} from '@zakkster/lite-di-supervisor';
 import {Health, LANES} from '@zakkster/lite-di-health';
 import {fromContainer, toJSON} from '@zakkster/lite-di-graph';
-import {useScopedSignals} from '@zakkster/lite-di-signal';
+import {createSignalScope, SIGNAL_REGISTRY_TOKEN} from '@zakkster/lite-di-signal';
 import {createRegistry} from '@zakkster/lite-signal';
 import {createSocketFactory} from '@zakkster/lite-ws';
 import {RingBuffer} from '@zakkster/lite-ring-buffer';
@@ -28,9 +28,13 @@ import {TAG_QUOTE, TAG_DEPTH, TAG_TRADE, MAXLVL, parseFrame, OrderBook} from './
 
 const RING = 2048;                 // SEAM: size to your firehose window
 const TRADE_RING = 256;            // recent-trade window (pow2, scalar rings)
+const POLL_MS = 100;               // per-scope background-ingest poll cadence (G1)
 const TAU = Math.PI * 2;
 const DOT_BUY = '#4EE7D2';         // taker-buy trade dot (teal)
 const DOT_SELL = '#F5A623';        // taker-sell trade dot (ember)
+// Narrated reverse-teardown order for a scope close. The closed-line is built from
+// this list marked against the ACTUAL failed steps, so it never claims a step that threw.
+const TEARDOWN_ORDER = ['feed', 'agg', 'tape', 'book', 'signal-registry'];
 // Feed sources. Each live symbol is ONE combined Binance stream carrying three
 // channels: depth20@100ms (the REAL 20-level ladder), aggTrade (the trade tape),
 // and bookTicker (a dense best-quote for the price trace). `sim` is the in-page
@@ -162,36 +166,78 @@ class TradeApply {
 
 // Trace-bus handler. The numeric traceBus records mid SCALARS live (0 B/emit, unboxed
 // doubles); its capture drives replay. This handler pushes into the tape ONLY while
-// replaying (refs.replaying) -- live, TapeApply already fills the tape off the object bus,
-// so gating here avoids a double-advance while still repainting the price trace on replay.
+// replaying (a per-scope replayCtl.on) -- live, TapeApply already fills the tape off the
+// object bus, so gating here avoids a double-advance while still repainting on replay.
+// replayCtl is a per-scope value (S3): replay is now scoped, no module-global flag.
 class MidReplay {
-    constructor(tape) {
+    constructor(tape, replayCtl) {
         this.tape = tape;
+        this.replayCtl = replayCtl;
     }
 
     handle(mid) {
-        if (refs.replaying) this.tape.push(mid);
+        if (this.replayCtl.on) this.tape.push(mid);
     }
 }
 
-// cron jobs: DI-constructed wall-clock housekeeping.
-const refs = {stats: {pruned: 0, aggregations: 0, heartbeats: 0}, replaying: false};
-
+// cron jobs: DI-constructed wall-clock housekeeping. S3 (finding 12): the counters
+// live in the container as a `stats` VALUE, injected as a dep -- so two boots never
+// share a module-global object, and a re-boot resets to zero honestly.
 class AggregateJob {
+    constructor(stats) {
+        this.stats = stats;
+    }
+
     run() {
-        refs.stats.aggregations++;
+        this.stats.aggregations++;
     }
 }
 
 class PruneJob {
+    constructor(stats) {
+        this.stats = stats;
+    }
+
     run() {
-        refs.stats.pruned++;
+        this.stats.pruned++;
     }
 }
 
 class HeartbeatJob {
+    constructor(stats) {
+        this.stats = stats;
+    }
+
     run() {
-        refs.stats.heartbeats++;
+        this.stats.heartbeats++;
+    }
+}
+
+// Per-scope feed poll (background ingest, G1). A DI cron job so a non-active symbol
+// keeps pulling its socket OFF the render frame. Every scope runs this cron; the active
+// tab is ADDITIONALLY polled per-frame inside RenderSystem.update() for live freshness
+// (poll() is idempotent, so the extra pump is harmless), while non-active tabs rely on
+// this cron alone -- so tickCount keeps rising with zero cost to the render budget.
+// Injected `pollctl.poll` reads the scope's CURRENT socket (survives a supervisor re-resolve).
+class PollJob {
+    constructor(pollctl) {
+        this.pollctl = pollctl;
+    }
+
+    run() {
+        this.pollctl.poll();
+    }
+}
+
+// Per-scope rate sampler (quotes+depth per second, trades per second). A cron job, not
+// a stray setInterval, so it tears down with the scope and stays graph-resident.
+class RateJob {
+    constructor(ratectl) {
+        this.ratectl = ratectl;
+    }
+
+    run() {
+        this.ratectl.sample();
     }
 }
 
@@ -349,6 +395,13 @@ class GLRenderer {
         this.mode = 'gl';
         this.pts = new Float32Array((RING + TRADE_RING) * 8);
         this.quads = new Float32Array(MAXLVL * 2 * 9);
+        // Trace point size + palette as instance fields, read (never allocated) in the
+        // hot body -- so a rebind() to GLRendererV2 swaps the visible build in one frame.
+        this.ptSize = 3.5;
+        this.tpSize = 5;
+        this.cr = 0.306;
+        this.cg = 0.906;
+        this.cb = 0.82;
     }
 
     draw(v, book, scratch, n) {
@@ -409,21 +462,21 @@ class GLRenderer {
                 lo = 0;
                 hi = 1;
             }
-            const span = (hi - lo) || 1, d = this.pts,
-                usableH = h - 24 * dpr, botPad = 12 * dpr, ptSize = 3.5 * dpr, denom = (n - 1 || 1);
+            const span = (hi - lo) || 1, d = this.pts, cr = this.cr, cg = this.cg, cb = this.cb,
+                usableH = h - 24 * dpr, botPad = 12 * dpr, ptSize = this.ptSize * dpr, denom = (n - 1 || 1);
             for (let i = 0; i < n; i++) {
                 const b = i * 8;
                 d[b] = (i / denom) * plotW;
                 d[b + 1] = h - ((scratch[i] - lo) / span) * usableH - botPad;
                 d[b + 2] = ptSize;
-                d[b + 3] = 0.306;
-                d[b + 4] = 0.906;
-                d[b + 5] = 0.82;
+                d[b + 3] = cr;
+                d[b + 4] = cg;
+                d[b + 5] = cb;
                 d[b + 6] = 1.0;
                 d[b + 7] = 0;
             }
             const nt = v.nTrades, tp = v.tradePx, ts = v.tradeSide, base = n * 8,
-                denomT = (nt - 1) || 1, tpSize = 5 * dpr;
+                denomT = (nt - 1) || 1, tpSize = this.tpSize * dpr;
             for (let i = 0; i < nt; i++) {
                 const b = base + i * 8, buy = ts[i] > 0;
                 d[b] = (i / denomT) * plotW;
@@ -441,41 +494,340 @@ class GLRenderer {
     }
 }
 
-// ticker system: pulls the socket once per frame, then selects + draws.
+// Rebind target (GAP-3): a post-boot renderer HOT-SWAP proof. Same GL geometry, a
+// louder build -- bigger ember trace points -- so `rebind('renderer:gpu', v2)` is
+// visible in the very next frame (requires zoom >= 2.2 to select the gpu strategy).
+// A VALUE (no GL resources of its own; it draws through the shared parent sink), so
+// the un-torn-down old instance is harmless (owner risk 6).
+class GLRendererV2 extends GLRenderer {
+    constructor() {
+        super();
+        this.ptSize = 6;
+        this.tpSize = 8;
+        this.cr = 0.96;
+        this.cg = 0.65;
+        this.cb = 0.14;
+    }
+}
+
+// ticker system [HOT]: pulls the ACTIVE scope's socket once per frame, then selects +
+// draws. deps ['viz'] ONLY -- the per-symbol book/tape/agg/feed live behind the single
+// pre-allocated `viz.active` holder, mutated on tab switch (cold). No c.get, no literal,
+// no closure in this body; a background symbol's ingest is pumped by its own PollJob.
 class RenderSystem {
-    constructor(viz, book, tape, agg, tradePx, tradeSide) {
+    constructor(viz) {
         this.viz = viz;
-        this.book = book;
-        this.tape = tape;
-        this.agg = agg;
-        this.tradePx = tradePx;
-        this.tradeSide = tradeSide;
     }
 
     update() {
         const v = this.viz;
         if (!v.router || !v.ctx) return;
-        if (v.feedPoll) v.feedPoll();                       // lite-ws: wake once per frame
-        const n = this.tape.count;
-        this.tape.copyTo(v.scratch, 0);   // ring -> scratch (oldest-first)
-        const nt = this.tradePx.count;
-        this.tradePx.copyTo(v.tradePx, 0);                  // scalar rings -> preallocated views
-        this.tradeSide.copyTo(v.tradeSide, 0);
+        const a = v.active;
+        if (!a) return;                                     // no live symbol -> idle
+        a.feedPoll();                                       // active scope: wake its socket
+        const n = a.tape.count;
+        a.tape.copyTo(v.scratch, 0);                        // ring -> scratch (oldest-first)
+        const nt = a.tradePx.count;
+        a.tradePx.copyTo(v.tradePx, 0);                     // scalar rings -> preallocated views
+        a.tradeSide.copyTo(v.tradeSide, 0);
         v.nTrades = nt;
         const r = v.router.resolve(v.zoom);                 // lite-di-strategies selects the renderer
         if (v.setMode) v.setMode(r.mode);                   // toggle 2d <-> gl canvas
-        r.draw(v, this.book, v.scratch, n);
+        r.draw(v, a.book, v.scratch, n);
     }
+}
+
+// rx primitives bound to a scope's OWN registry (cold, per-scope setup).
+function rxOf(sc) {
+    const reg = sc.get(SIGNAL_REGISTRY_TOKEN);
+    return {signal: reg.signal.bind(reg), computed: reg.computed.bind(reg)};
+}
+
+// Per-symbol child scope (finding 7). Each symbol owns feed / book / tape / agg +
+// its OWN lite-di-signal registry, its OWN object bus + numeric trace recorder, and
+// its OWN supervisor/health so killing one feed faults ONE scope. The registry is
+// created via createSignalScope (eager -> _resolutionOrder[0]) so it tears down LAST.
+// Cold factory: everything here runs once, at tab open, never per frame.
+function createSymbolScope(parent, {symbol, url, log, faulty}) {
+    const s = createSignalScope(parent, {createRegistry});   // registry pinned first, torn down last
+    const scopeReg = s.get(SIGNAL_REGISTRY_TOKEN);
+
+    // tape / book / agg / trade rings are singleton(Factory) -- NEVER value: a VALUE
+    // returns before the isCached block (Container.js:237) so it is never in the
+    // resolution order and never torn down or counted. Anything that must appear in
+    // the teardown walk is a singleton.
+    s.value('symbol', symbol);
+    s.singletonFactory('tape', () => new RingBuffer(RING));
+    s.singleton('book', OrderBook);
+    s.singletonFactory('agg', (sc) => new Aggregates(rxOf(sc)));
+    s.singletonFactory('trades:px', () => new RingBuffer(TRADE_RING));
+    s.singletonFactory('trades:side', () => new RingBuffer(TRADE_RING));
+
+    const replayCtl = {on: false};                           // per-scope replay gate
+    s.value('replayCtl', replayCtl);
+
+    // Object bus (unrecorded) + numeric trace recorder. Registered as singletons so
+    // their onTeardown -> dispose() actually fires (risk 4): a VALUE would leak the
+    // recorder ring across the 50x churn gate (G2).
+    const bus = new EventBus(s);
+    bus.on('tick', TapeApply, ['tape']).on('tick', AggApply, ['agg'])
+        .on('trade', TradeApply, ['trades:px', 'trades:side']);
+    s.singletonFactory('bus', () => bus);
+    s.onTeardown('bus', (b) => {
+        try {
+            b.dispose();
+        } catch {
+        }
+    });
+
+    const traceBus = new EventBus(s);
+    traceBus.on('mid', MidReplay, ['tape', 'replayCtl']);
+    s.singletonFactory('traceBus', () => traceBus);
+    s.onTeardown('traceBus', (b) => {
+        try {
+            b.dispose();
+        } catch {
+        }
+    });
+
+    // per-scope feed lifecycle + counters (all scope-local, no module globals)
+    let feedUrl = url, sock = null;
+    let quoteCount = 0, depthCount = 0, tradeCount = 0, qps = 0, trps = 0, lastQ = 0, lastT = 0;
+    let book = null, tape = null, agg = null, tradePx = null, tradeSide = null;
+
+    // Single cold dispatch seam (the ONLY place the wire tag is inspected). book is
+    // assigned after boot; dispatch runs only after sup.start() opens the socket.
+    const dispatch = (f) => {
+        switch (f.tag) {
+            case TAG_DEPTH:
+                book.applyDepth(f);
+                bus.emit('tick', f);
+                traceBus.emit('mid', f.mid);
+                depthCount++;
+                break;
+            case TAG_QUOTE:
+                if (book.synthetic) book.applySynthQuote(f);
+                bus.emit('tick', f);
+                traceBus.emit('mid', f.mid);
+                quoteCount++;
+                break;
+            case TAG_TRADE:
+                bus.emit('trade', f);
+                tradeCount++;
+                break;
+        }
+    };
+
+    const {createSocket} = createSocketFactory(scopeReg);     // per-scope socket factory
+    const makeSocket = () => feedUrl.startsWith('sim://')
+        ? makeSimSocket(dispatch)
+        : createSocket(feedUrl, {
+            onMessage: (data) => {
+                try {
+                    const fr = parseFrame(data);
+                    if (fr) dispatch(fr);
+                } catch {
+                }
+            },
+            backoff: {min: 250, max: 4000, factor: 2, jitter: 0.5},
+        });
+    s.value('makeSocket', makeSocket);
+    s.singleton('feed', Feed, ['makeSocket']);
+    s.onTeardown('feed', (fd) => {
+        sock = null;
+        try {
+            fd.dispose();
+        } catch {
+        }
+    });
+
+    // dev-only fault injection (?faultyTeardown): one scope binding throws on teardown;
+    // container isolation (D-12) still fires the siblings and routes the error.
+    if (faulty) s.onTeardown('book', () => {
+        throw new Error('injected teardown fault (?faultyTeardown)');
+    });
+
+    const refreshFeed = () => {
+        try {
+            sock = s.get('feed').sock;
+        } catch {
+            sock = null;
+        }
+    };
+    const feedPoll = () => {
+        const so = sock;
+        if (so) {
+            try {
+                so.poll();
+            } catch {
+            }
+        }
+    };
+    s.value('pollctl', {poll: feedPoll});
+
+    const degradeTo = (u, kind, msg) => {
+        const toSim = u.startsWith('sim://');
+        feedUrl = u;
+        try {
+            tape.reset();
+            tradePx.reset();
+            tradeSide.reset();
+            if (toSim) book.synthetic = true;
+        } catch {
+        }
+        log(kind, msg);
+        sup.reportFault('feed').catch(() => {
+        });
+    };
+
+    const failover = {
+        armed: true,
+        count: 0,
+        down: () => !sock || !sock.isOpen(),
+        isSim: () => feedUrl.startsWith('sim://'),
+        trip: () => degradeTo(SOURCES.sim, 'escalate', symbol + ': live feed unreachable -- degrading to simulation'),
+    };
+    s.value('failover', failover);
+
+    const ratectl = {
+        sample: () => {
+            const q = quoteCount + depthCount;
+            qps = q - lastQ;
+            lastQ = q;
+            trps = tradeCount - lastT;
+            lastT = tradeCount;
+            if (agg) agg.tps.set(qps);
+        },
+    };
+    s.value('ratectl', ratectl);
+
+    // per-scope supervisor + health (risk 3: Supervisor accepts the child scope as its
+    // container -- a Container instance carrying isBooted/invalidate/get, verified).
+    let restarts = 0;
+    const sup = new Supervisor(s, {
+        children: ['feed'], strategy: STRATEGIES.ONE_FOR_ONE, maxRestarts: 30, windowMs: 60000,
+        onRestart: () => {
+            restarts++;
+            refreshFeed();
+            log('heal', symbol + ': feed re-resolved -- dialing a fresh socket');
+        },
+        onEscalate: () => log('escalate', symbol + ': restart budget exhausted -- feed left down (fail closed)'),
+    });
+    const health = new Health();
+    health.source('feed', () => (sock && sock.isOpen() ? 0 : 1), LANES.READY);
+    health.source('loop', () => 0, LANES.LIVE);
+    health.watchSupervisor('supervisor', sup, LANES.READY);
+
+    // per-scope cron: fast background poll (G1) + 1s failover watchdog + 1s rate sampler.
+    // A dedicated fast cron for poll so a background tab is not starved by 1s granularity.
+    const scron = new Cron(s, {tickMs: POLL_MS});
+    scron.job('poll', PollJob, interval(POLL_MS), {deps: ['pollctl']})
+        .job('failover', FailoverJob, interval(1000), {deps: ['failover']})
+        .job('rate', RateJob, interval(1000), {deps: ['ratectl']});
+
+    s.boot();
+    bus.boot();
+    traceBus.boot();
+    // Eager resolve in an order that makes the reverse teardown read
+    // feed -> agg -> tape -> book -> signal-registry (registry is index 0).
+    book = s.get('book');
+    tape = s.get('tape');
+    agg = s.get('agg');
+    tradePx = s.get('trades:px');
+    tradeSide = s.get('trades:side');
+    s.get('bus');
+    s.get('traceBus');
+
+    let nodeCount = 0;
+    try {
+        nodeCount = (fromContainer(s).nodes || []).length;
+    } catch {
+        nodeCount = 0;
+    }
+
+    return {
+        symbol, scope: s, nodeCount,
+        book, tape, agg, tradePx, tradeSide, feedPoll,
+        async start() {
+            await sup.start();                               // resolves 'feed' -> opens the socket
+            refreshFeed();
+            traceBus.record(RING, {onOverflow: 'drop-oldest'});
+            scron.start();
+        },
+        state() {
+            let status = 'closed', latency = -1, attempts = 0, open = false;
+            const so = sock;
+            if (so) {
+                try {
+                    status = so.status();
+                    latency = so.latency();
+                    attempts = so.reconnectAttempts();
+                    open = so.isOpen();
+                } catch {
+                }
+            }
+            return {
+                mid: agg.mid(), bid: agg.bid(), ask: agg.ask(), spread: agg.spread(), qps, trps,
+                levels: book ? book.n : 0, syntheticLadder: book ? book.synthetic : true,
+                readyz: health.readyz(), livez: health.livez(), supState: sup.state, restarts,
+                recorded: traceBus.recorded(), status, latency, attempts, open,
+                ticks: quoteCount + depthCount + tradeCount,
+            };
+        },
+        setSource(u) {
+            failover.armed = false;                          // a manual choice disarms the watchdog for good
+            degradeTo(u, 'heal', symbol + ': switching feed -> ' + u.replace(/^wss?:\/\//, ''));
+        },
+        killFeed() {
+            sup.reportFault('feed').catch(() => {
+            });
+        },
+        replay() {
+            replayCtl.on = true;
+            let n = 0;
+            try {
+                n = traceBus.replay();
+            } finally {
+                replayCtl.on = false;
+            }
+            log('replay', symbol + ': replayed ' + n + ' recorded ticks');
+            return n;
+        },
+        async close(outerOnTeardownError) {
+            log('down', 'teardown: feed[' + symbol + ']');
+            scron.stop();
+            const regNodes = scopeReg.stats().activeNodes;   // read the live count BEFORE destroy
+            // Capture which bindings actually threw so the closed-line reflects the real
+            // outcome (?faultyTeardown makes 'book' throw); still route each error outward.
+            const failed = [];
+            const onTeardownError = (err, name) => {
+                failed.push(String(name));
+                if (outerOnTeardownError) outerOnTeardownError(err, name);
+            };
+            await s.shutdown({onTeardownError});             // reverse-topological, registry last
+            let walk = '';
+            for (let i = 0; i < TEARDOWN_ORDER.length; i++) {
+                const step = TEARDOWN_ORDER[i];
+                walk += (i ? ' -> ' : '') + step + (failed.indexOf(step) !== -1 ? ' (failed)' : '');
+            }
+            log('down', 'scope: ' + symbol + ' closed -- teardown: ' + walk);
+            log('down', 'scope: ' + symbol + ' registry destroyed -- ' + regNodes + ' reactive nodes released');
+        },
+    };
 }
 
 export async function bootKernel({ctx, gl, w, h, dpr, onEvent, onMode}) {
     const log = (kind, msg) => onEvent && onEvent(kind, msg);
+    // ?faultyTeardown read ONCE, cold, at boot (never on the hot path).
+    const faulty = typeof location !== 'undefined'
+        && new URLSearchParams(location.search).has('faultyTeardown');
+
     const viz = {
-        ctx, w, h, dpr: dpr || 1, zoom: 1, router: null, scratch: new Float32Array(RING),
+        ctx, w, h, dpr: dpr || 1, zoom: 1, router: null, active: null, scratch: new Float32Array(RING),
         tradePx: new Float32Array(TRADE_RING), tradeSide: new Float32Array(TRADE_RING), nTrades: 0,
-        feedPoll: null, glSink: null, glQuadSink: null, setMode: onMode || null
+        glSink: null, glQuadSink: null, setMode: onMode || null,
     };
-    try {                                                                        // lite-gl WebGL2 sinks
+    try {                                                                        // lite-gl WebGL2 sinks (shared, risk 5)
         if (gl) {
             viz.glSink = createPointSink(gl, {capacity: RING + TRADE_RING});
             viz.glQuadSink = createQuadSink(gl, {capacity: MAXLVL * 2});
@@ -484,272 +836,206 @@ export async function bootKernel({ctx, gl, w, h, dpr, onEvent, onMode}) {
         log('down', 'WebGL2 unavailable -- GPU renderer disabled');
     }
 
+    // The single pre-allocated active-symbol holder. Mutated on tab switch (cold);
+    // read by RenderSystem.update() every frame, never re-allocated.
+    const activeHolder = {book: null, tape: null, agg: null, feedPoll: null, tradePx: null, tradeSide: null};
+
     const c = new Container();
     c.value('viz', viz);
-
-    const rx = useScopedSignals(c, {createRegistry});     // lite-di-signal scoped registry
-    const agg = new Aggregates(rx);
-    c.value('agg', agg);
-    c.value('tape', new RingBuffer(RING));                    // lite-ring-buffer (pow2, bitmask wrap)
-    c.value('trades:px', new RingBuffer(TRADE_RING));         // recent-trade price ring (scalars)
-    c.value('trades:side', new RingBuffer(TRADE_RING));       // recent-trade side ring (+1 buy / -1 sell)
-    c.singleton('book', OrderBook);
+    const stats = {pruned: 0, aggregations: 0, heartbeats: 0};   // finding 12: counters IN the container
+    c.value('stats', stats);
     c.value('renderer:coarse', new CoarseRenderer());
     c.value('renderer:detailed', new DetailedRenderer());
-    c.value('renderer:gpu', new GLRenderer());               // lite-gl instanced points + quads
+    c.value('renderer:gpu', new GLRenderer());                  // rebind target -- a VALUE (risk 6)
 
-    // event-bus fan-out (boot-locked topology). The OBJECT bus is NOT recorded: its
-    // handlers consume each frame synchronously, so S2 may reuse per-tag scratch freely.
-    // 'tick' carries QUOTE/DEPTH frames (tape + aggregates); 'trade' carries aggTrade
-    // frames into the two scalar rings. The book itself is applied in the cold dispatch
-    // switch below, where the DEPTH-vs-QUOTE choice lives -- never in a hot handler.
-    const bus = new EventBus(c);
-    bus.on('tick', TapeApply, ['tape']).on('tick', AggApply, ['agg'])
-        .on('trade', TradeApply, ['trades:px', 'trades:side']);
-
-    // Dedicated numeric flight-recorder. Carries mid SCALARS only -- an unboxed-double
-    // payload array, so each capture is an inline store (no per-tick HeapNumber boxing) and
-    // replay is honest (replaying object references off the reused-scratch bus would redraw
-    // a flat line). This is the recorded bus; the object bus above is not.
-    const traceBus = new EventBus(c);
-    traceBus.on('mid', MidReplay, ['tape']);
-    c.value('traceBus', traceBus);
-    c.onTeardown('traceBus', (b) => {
-        try {
-            b.dispose();
-        } catch {
-        }
-    });
-
-    // lite-ws: bind lifecycle signals to the SAME scoped registry, then dial the feed.
-    // onMessage is the per-message pipe (0 B/emit fan-out); status/latency stay coarse signals.
-    const {createSocket} = createSocketFactory(rx.registry);
-    let quoteCount = 0, depthCount = 0, tradeCount = 0, feedUrl = FEED_URL, bookRef = null;
-    // Single frame dispatch point. This is the ONLY place the wire tag is inspected: the
-    // switch is the cold seam. DEPTH sets the REAL 20-level ladder; QUOTE only fabricates a
-    // ladder when the book is still synthetic (sim / local-quote), so a live bookTicker
-    // never clobbers a real depth ladder -- it just feeds the dense price trace. TRADE fans
-    // to the two scalar rings. Every downstream handler (tape/agg/trade) is tag-agnostic.
-    const dispatch = (f) => {
-        switch (f.tag) {
-            case TAG_DEPTH:
-                bookRef.applyDepth(f);
-                bus.emit('tick', f);            // tape + aggregates (synchronous, unrecorded)
-                traceBus.emit('mid', f.mid);    // scalar-only, recorded -> zero-GC honest replay
-                depthCount++;
-                break;
-            case TAG_QUOTE:
-                if (bookRef.synthetic) bookRef.applySynthQuote(f);
-                bus.emit('tick', f);
-                traceBus.emit('mid', f.mid);
-                quoteCount++;
-                break;
-            case TAG_TRADE:
-                bus.emit('trade', f);           // -> TradeApply -> two scalar rings
-                tradeCount++;
-                break;
-        }
-    };
-    // Resolve sim vs wire ONCE, here. The hot body never sees the distinction. The sim
-    // socket emits a QUOTE-tagged scratch; the wire socket decodes via parseFrame. Both
-    // funnel through dispatch, so the tag switch stays the single cold seam.
-    const makeSocket = () => feedUrl.startsWith('sim://')
-        ? makeSimSocket(dispatch)
-        : createSocket(feedUrl, {
-            onMessage: (data) => {
-                try {
-                    const f = parseFrame(data);
-                    if (f) dispatch(f);
-                } catch {
-                }
-            },
-            backoff: {min: 250, max: 4000, factor: 2, jitter: 0.5},
-        });
-    c.value('makeSocket', makeSocket);
-    c.singleton('feed', Feed, ['makeSocket']);
-    // Hot-path cache: hold the resolved socket so the render loop never does c.get('feed')
-    // per frame. Refreshed on every (re)resolve; nulled on teardown so a disposed socket
-    // is never polled.
-    let activeSock = null;
-    const refreshFeed = () => {
-        try {
-            activeSock = c.get('feed').sock;
-        } catch {
-            activeSock = null;
-        }
-    };
-    c.onTeardown('feed', (f) => {
-        activeSock = null;
-        try {
-            f.dispose();
-        } catch {
-        }
-    });  // re-resolve closes the old socket
-
-    // render loop
     const ticker = new Ticker(c);
-    ticker.system('render', RenderSystem, {lane: 'normal', deps: ['viz', 'book', 'tape', 'agg', 'trades:px', 'trades:side']});
+    ticker.system('render', RenderSystem, {lane: 'normal', deps: ['viz']});      // deps: viz ONLY (hot)
 
-    // scheduled housekeeping
     const cron = new Cron(c, {tickMs: 1000});
-    cron.job('aggregate', AggregateJob, interval(5000))
-        .job('prune', PruneJob, interval(3000))
-        .job('heartbeat', HeartbeatJob, interval(2000));
+    cron.job('aggregate', AggregateJob, interval(5000), {deps: ['stats']})
+        .job('prune', PruneJob, interval(3000), {deps: ['stats']})
+        .job('heartbeat', HeartbeatJob, interval(2000), {deps: ['stats']});
 
-    // health + supervisor over the feed subsystem
-    const health = new Health();
-    health.source('feed', () => (activeSock && activeSock.isOpen() ? 0 : 1), LANES.READY);  // pure fail-closed read
-
-    health.source('loop', () => 0, LANES.LIVE);
-    let restarts = 0;
-    const sup = new Supervisor(c, {
-        children: ['feed'], strategy: STRATEGIES.ONE_FOR_ONE, maxRestarts: 30, windowMs: 60000,
-        onRestart: () => {
-            restarts++;
-            refreshFeed();
-            log('heal', 'feed subsystem re-resolved -- dialing a fresh socket');
-        },
-        onEscalate: () => log('escalate', 'restart budget exhausted -- feed left down (fail closed)'),
-    });
-    health.watchSupervisor('supervisor', sup, LANES.READY);
-
-    // Shared degrade path: switch feedUrl, clear the rings (price scale differs), log, and
-    // fault the feed so the supervisor re-resolves a fresh socket. Used by BOTH a manual
-    // source switch and the failover watchdog -- one place holds the resets + reportFault.
-    // Switching TO sim re-arms the synthetic ladder so its QUOTE frames refabricate levels
-    // instead of freezing the last real depth.
-    const degradeTo = (url, kind, msg) => {
-        const toSim = url.startsWith('sim://');
-        feedUrl = url;
-        try {
-            c.get('tape').reset();
-            c.get('trades:px').reset();
-            c.get('trades:side').reset();
-            if (toSim) c.get('book').synthetic = true;
-        } catch {
-        }
-        log(kind, msg);
-        sup.reportFault('feed').catch(() => {
+    // shutdown bookkeeping + parent teardown narration (task 12: the walk narrates itself).
+    let teardownFailed = 0, teardownTotal = 0;
+    const onTeardownError = (err, name) => {
+        teardownFailed++;
+        log('escalate', 'teardown-error: ' + String(name) + ' -- ' + err.message);
+    };
+    for (const id of ['aggregate', 'prune', 'heartbeat']) {
+        c.onTeardown('cron:job:' + id, () => {
+            teardownTotal++;
+            log('down', 'teardown: cron:' + id);
         });
-    };
-
-    // Watchdog control surface (injected into FailoverJob). Closures read the live locals;
-    // `armed` is disarmed permanently by the first manual setSource (a choice must stick).
-    const failover = {
-        armed: true,
-        count: 0,
-        down: () => !activeSock || !activeSock.isOpen(),
-        isSim: () => feedUrl.startsWith('sim://'),
-        trip: () => degradeTo(SOURCES.sim, 'escalate', 'live feed unreachable -- degrading to simulation'),
-    };
-    c.value('failover', failover);
-    cron.job('failover', FailoverJob, interval(1000), {deps: ['failover']});
+    }
 
     c.boot();
-    bus.boot();
-    traceBus.boot();
-    bookRef = c.get('book');                                  // resolve the book once for the cold dispatch
-    await sup.start();                                        // resolves 'feed' -> opens the socket
-    refreshFeed();                                            // cache the initial socket for the hot path
+    ticker.start();
+    cron.start();
+
+    const scopes = new Map();
+    let activeSymbol = null, nodeCount = 0, gpuV2 = false, shuttingDown = false;
+
+    const recomputeNodes = () => {
+        let total = 0;
+        try {
+            total = (fromContainer(c).nodes || []).length;
+            for (const h of scopes.values()) total += h.nodeCount;
+        } catch {
+            total = 0;
+        }
+        nodeCount = total;
+    };
+    recomputeNodes();
+
+    const setActive = (sym) => {
+        const h = sym !== null ? scopes.get(sym) : null;
+        if (!h) {
+            activeSymbol = null;
+            viz.active = null;
+            // Drop references to the drained scope so the holder pins nothing (G2).
+            activeHolder.book = null;
+            activeHolder.tape = null;
+            activeHolder.agg = null;
+            activeHolder.feedPoll = null;
+            activeHolder.tradePx = null;
+            activeHolder.tradeSide = null;
+            return;
+        }
+        activeSymbol = sym;
+        activeHolder.book = h.book;
+        activeHolder.tape = h.tape;
+        activeHolder.agg = h.agg;
+        activeHolder.feedPoll = h.feedPoll;
+        activeHolder.tradePx = h.tradePx;
+        activeHolder.tradeSide = h.tradeSide;
+        viz.active = activeHolder;
+    };
+
+    const addSymbol = async (sym, u) => {
+        if (scopes.has(sym)) {
+            setActive(sym);
+            return scopes.get(sym);
+        }
+        const h = createSymbolScope(c, {symbol: sym, url: u, log, faulty});
+        await h.start();
+        scopes.set(sym, h);
+        recomputeNodes();
+        log('heal', 'scope: ' + sym + ' opened -- child scope + own signal registry (' + h.nodeCount + ' bindings)');
+        if (activeSymbol === null) setActive(sym);
+        return h;
+    };
+
+    const closeSymbol = async (sym) => {
+        const h = scopes.get(sym);
+        if (!h) return;
+        await h.close(onTeardownError);                      // child before parent (Container.js child-guard)
+        scopes.delete(sym);
+        recomputeNodes();
+        if (activeSymbol === sym) setActive(scopes.size > 0 ? scopes.keys().next().value : null);
+    };
+
+    // rebind hot-swap (GAP-3): renderer:gpu is a VALUE; invalidate() is a no-op for a
+    // value so the swap is instant and the router needs no reconfiguration.
+    const swapRenderer = async () => {
+        await c.rebind('renderer:gpu', {type: TYPES.VALUE, value: new GLRendererV2(), isAsync: false});
+        gpuV2 = true;
+        log('rebind', 'rebind: renderer:gpu -> v2 (post-boot hot-swap, GAP-3)');
+        if (viz.zoom < 2.2) log('rebind', 'rebind: zoom is ' + viz.zoom.toFixed(1) + 'x -- raise zoom >= 2.2x to see the gpu build');
+    };
+
+    // boot with one live symbol.
+    await addSymbol('BTCUSDT', SOURCES.BTCUSDT);
 
     viz.router = new StrategyRouter(c, {
         strategies: {coarse: 'renderer:coarse', detailed: 'renderer:detailed', gpu: 'renderer:gpu'},
         gate: (zoom) => (viz.glSink && zoom >= 2.2 ? 'gpu' : (zoom >= 1.5 ? 'detailed' : 'coarse')),
     });
-    viz.feedPoll = () => {
-        const s = activeSock;
-        if (s) {
-            try {
-                s.poll();
-            } catch {
-            }
-        }
-    };  // cached ref, no per-frame c.get
 
-    traceBus.record(RING, {onOverflow: 'drop-oldest'});    // event-bus 1.1.0 flight recorder (scalars only)
-    ticker.start();
-    cron.start();
-
-    let nodeCount = 0;
-    try {
-        nodeCount = (fromContainer(c).nodes || []).length;
-        toJSON(fromContainer(c));
-    } catch {
-        nodeCount = 0;
-    }
-
-    // rate sampler: quotes+depth per second (qps) and trades per second (trps)
-    let qps = 0, trps = 0, lastQ = 0, lastT = 0;
-    const tpsTimer = setInterval(() => {
-        const q = quoteCount + depthCount;
-        qps = q - lastQ;
-        lastQ = q;
-        trps = tradeCount - lastT;
-        lastT = tradeCount;
-        agg.tps.set(qps);
-    }, 1000);
+    const active = () => (activeSymbol !== null ? scopes.get(activeSymbol) : null);
 
     return {
         readState() {
-            let status = 'closed', latency = -1, attempts = 0, open = false;
-            const s = activeSock;
-            if (s) {
-                try {
-                    status = s.status();
-                    latency = s.latency();
-                    attempts = s.reconnectAttempts();
-                    open = s.isOpen();
-                } catch {
-                }
-            }
-            return {
-                mid: agg.mid(), bid: agg.bid(), ask: agg.ask(), spread: agg.spread(), qps, trps,
-                levels: bookRef ? bookRef.n : 0, syntheticLadder: bookRef ? bookRef.synthetic : true,
-                readyz: health.readyz(), livez: health.livez(), supState: sup.state, restarts,
-                recorded: traceBus.recorded(), nodeCount, jobs: refs.stats,
-                status, latency, attempts, open,
+            const h = active();
+            const base = {
+                symbol: activeSymbol, symbols: scopes.size, nodeCount, jobs: stats,
+                gpuBuild: gpuV2 ? 'v2' : 'v1',
+                mid: 0, bid: 0, ask: 0, spread: 0, qps: 0, trps: 0, levels: 0,
+                syntheticLadder: true, readyz: 1, livez: 1, supState: 0, restarts: 0,
+                recorded: 0, status: 'closed', latency: -1, attempts: 0, open: false, ticks: 0,
             };
+            if (!h) return base;
+            const st = h.state();
+            base.mid = st.mid;
+            base.bid = st.bid;
+            base.ask = st.ask;
+            base.spread = st.spread;
+            base.qps = st.qps;
+            base.trps = st.trps;
+            base.levels = st.levels;
+            base.syntheticLadder = st.syntheticLadder;
+            base.readyz = st.readyz;
+            base.livez = st.livez;
+            base.supState = st.supState;
+            base.restarts = st.restarts;
+            base.recorded = st.recorded;
+            base.status = st.status;
+            base.latency = st.latency;
+            base.attempts = st.attempts;
+            base.open = st.open;
+            base.ticks = st.ticks;
+            return base;
         },
         setZoom(z) {
             viz.zoom = z;
         },
-        setSource(url) {                                          // switch feed, re-dial via supervisor
-            failover.armed = false;                               // a manual choice disarms the watchdog for good
-            degradeTo(url, 'heal', 'switching feed -> ' + url.replace(/^wss?:\/\//, ''));
+        setSource(u) {
+            const h = active();
+            if (h) h.setSource(u);
+        },
+        killFeed() {
+            const h = active();
+            if (h) h.killFeed();
+        },
+        replay() {
+            const h = active();
+            return h ? h.replay() : 0;
+        },
+        swapRenderer,
+        addSymbol,
+        closeSymbol,
+        setActive,
+        symbols() {
+            return Array.from(scopes.keys());
+        },
+        activeSymbol() {
+            return activeSymbol;
         },
         sources: SOURCES,
-        killFeed() {
-            sup.reportFault('feed').catch(() => {
-            });
-        },   // subsystem fault -> supervisor heal
-        replay() {
-            refs.replaying = true;                                // MidReplay pushes to tape only while this is set
-            let n = 0;
-            try {
-                n = traceBus.replay();
-            } finally {
-                refs.replaying = false;
-            }
-            log('replay', 'replayed ' + n + ' recorded ticks');
-            return n;
-        },
         resize(nw, nh, ndpr) {
             viz.w = nw;
             viz.h = nh;
             if (ndpr) viz.dpr = ndpr;
         },
-        stop() {
-            clearInterval(tpsTimer);
+        async shutdown() {
+            if (shuttingDown) return;
+            shuttingDown = true;
+            log('down', 'shutdown: kernel draining -- children first');
             ticker.stop();
             cron.stop();
+            for (const sym of Array.from(scopes.keys())) await closeSymbol(sym);   // children first
             try {
-                if (activeSock) activeSock.dispose();
-            } catch {
+                await c.shutdown({onTeardownError});
+            } catch (e) {
+                log('escalate', 'shutdown: parent teardown error -- ' + (e && e.message ? e.message : String(e)));
             }
-            try {
-                traceBus.dispose();
-            } catch {
+            if (teardownFailed > 0) {
+                log('down', 'shutdown: complete -- ' + teardownFailed + ' of ' + (teardownTotal + teardownFailed) + ' teardowns failed (AggregateError, isolated)');
+            } else {
+                log('down', 'shutdown: complete -- ' + teardownTotal + ' teardowns, clean');
             }
+            viz.active = null;
+            if (onMode) onMode('shut');
         },
     };
 }

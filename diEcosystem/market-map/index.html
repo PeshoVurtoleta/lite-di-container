@@ -104,6 +104,15 @@
 
         .stage {
             position: relative;
+            display: flex;
+            flex-direction: column;
+            min-height: 0;
+        }
+
+        .canvas-wrap {
+            position: relative;
+            flex: 1;
+            min-height: 0;
         }
 
         .stage canvas {
@@ -116,6 +125,116 @@
 
         .stage canvas.hidden {
             display: none;
+        }
+
+        .tabs {
+            display: flex;
+            align-items: center;
+            gap: 0.375rem;
+            padding: 0.5rem 0.75rem;
+            border-bottom: 1px solid var(--line);
+            background: var(--panel);
+            flex-wrap: wrap;
+        }
+
+        .tab {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.5rem;
+            font-family: var(--mono);
+            font-size: .74rem;
+            color: var(--soft);
+            background: var(--panel2);
+            border: 1px solid var(--line2);
+            border-radius: 0.5rem;
+            padding: 0.3125rem 0.5625rem;
+            cursor: pointer;
+        }
+
+        .tab.active {
+            color: var(--accent);
+            border-color: var(--accent);
+        }
+
+        .tab.hidden {
+            display: none;
+        }
+
+        .tab-x {
+            color: var(--muted);
+            font-size: .8rem;
+            line-height: 1;
+        }
+
+        .tab-add {
+            font-family: var(--mono);
+            font-size: .74rem;
+            color: var(--soft);
+            background: transparent;
+            border: 1px dashed var(--line2);
+            border-radius: 0.5rem;
+            padding: 0.3125rem 0.625rem;
+            cursor: pointer;
+        }
+
+        .tab-input {
+            font-family: var(--mono);
+            font-size: .74rem;
+            color: var(--ink);
+            background: var(--panel2);
+            border: 1px solid var(--line2);
+            border-radius: 0.5rem;
+            padding: 0.3125rem 0.5625rem;
+            width: 8rem;
+            outline: none;
+        }
+
+        .tab-input.hidden {
+            display: none;
+        }
+
+        .tab-input:focus {
+            border-color: var(--accent);
+        }
+
+        @media (hover: hover) {
+            .tab:hover {
+                border-color: var(--accent);
+            }
+
+            .tab-x:hover {
+                color: var(--crit);
+            }
+
+            .tab-add:hover {
+                border-color: var(--accent);
+            }
+
+            .tab-input:hover {
+                border-color: var(--accent);
+            }
+        }
+
+        .shut-veil {
+            position: absolute;
+            inset: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-family: var(--mono);
+            font-size: 1.4rem;
+            letter-spacing: .3em;
+            color: var(--crit);
+            background: #090C12;
+            background: oklch(16.7% 0.018 260 / 0.92);
+            opacity: 0;
+            pointer-events: none;
+            transition: opacity .2s;
+        }
+
+        .shut-veil.on {
+            opacity: 1;
+            pointer-events: auto;
         }
 
         .stage-tag {
@@ -370,10 +489,14 @@
 <body>
 <div class="app">
     <div class="stage">
-        <canvas id="cv"></canvas>
-        <canvas id="gl" class="hidden"></canvas>
-        <div class="stage-tag">market-map &middot; live order book</div>
-        <div class="heal-banner" id="heal">RE-SYNCING FEED &middot; viewport live</div>
+        <div class="tabs" id="tabs"></div>
+        <div class="canvas-wrap">
+            <canvas id="cv"></canvas>
+            <canvas id="gl" class="hidden"></canvas>
+            <div class="stage-tag">market-map &middot; live order book</div>
+            <div class="heal-banner" id="heal">RE-SYNCING FEED &middot; viewport live</div>
+            <div class="shut-veil" id="shutveil">SHUT_DOWN</div>
+        </div>
     </div>
 
     <aside class="panel">
@@ -438,6 +561,8 @@
                     id="zoomv" class="v">1.0x</span></div>
             <button id="kill" class="danger">Kill feed &rarr; watch it self-heal</button>
             <button id="replay">Replay recorded session (event-bus)</button>
+            <button id="swap">Swap renderer build (rebind, GAP-3)</button>
+            <button id="shutdown" class="danger" data-state="up">Shutdown kernel</button>
         </div>
 
         <div class="group">
@@ -456,6 +581,7 @@
     import {bootKernel} from './kernel.js';
 
     const SUP = ['INIT', 'RUNNING', 'ESCALATED', 'SHUT_DOWN'];
+    const TAB_POOL = 8;                                  // fixed tab element pool; reused, never rebuilt wholesale
     const cv = document.getElementById('cv');
     const glc = document.getElementById('gl');
     const ctx = cv.getContext('2d');
@@ -463,7 +589,10 @@
     let dpr = Math.min(window.devicePixelRatio || 1, 2);
     const $ = (id) => document.getElementById(id);
 
+    // handle is null between shutdown and boot; every handler + the HUD null-guard it.
+    let handle = null;
     let W = 0, H = 0;
+    let curMode = '2d';
 
     function size() {
         dpr = Math.min(window.devicePixelRatio || 1, 2);   // FRESH each cold pass: pick up a monitor-DPI change
@@ -478,12 +607,13 @@
         return {W, H};
     }
 
-    size();
-
-    // toggle which canvas is visible when strategies swaps the renderer (deduped)
-    let curMode = '2d';
-
+    // toggle which canvas is visible when strategies swaps the renderer (deduped);
+    // 'shut' raises the SHUT_DOWN veil without clearing the (already-stopped) canvas.
     function setMode(mode) {
+        if (mode === 'shut') {
+            el.shutveil.classList.add('on');
+            return;
+        }
         if (mode === curMode) return;
         curMode = mode;
         if (mode === 'gl') {
@@ -495,8 +625,6 @@
         }
     }
 
-    const logEl = $('log');
-
     function pushLog(kind, msg) {
         const div = document.createElement('div');
         const tSpan = document.createElement('span');
@@ -506,76 +634,248 @@
         mSpan.className = kind;
         mSpan.textContent = msg;
         div.append(tSpan, document.createTextNode(' '), mSpan);
-        logEl.prepend(div);
-        while (logEl.children.length > 40) logEl.lastChild.remove();
+        el.log.prepend(div);
+        while (el.log.children.length > 40) el.log.lastChild.remove();
     }
 
     const fmt = (x) => (x == null || isNaN(x)) ? '--' : x.toFixed(2);
+    // Known quote assets. A typed symbol keeps its quote only when a real base precedes
+    // it (ETHUSDT, ETHBTC); a bare base (ETH, SOL, BTC) gets USDT appended.
+    const QUOTES = ['USDT', 'USDC', 'FDUSD', 'BUSD', 'BTC', 'ETH', 'BNB'];
+    const normalizeSymbol = (raw) => {
+        const s = (raw || '').trim().toUpperCase();
+        if (!s) return '';
+        for (let i = 0; i < QUOTES.length; i++) {
+            const q = QUOTES[i];
+            if (s.length > q.length && s.endsWith(q)) return s;   // base + quote -> leave
+        }
+        return s + 'USDT';                                        // bare base -> default quote
+    };
+    // Tab label: strip a known quote suffix so a full pair shows its base (ETHUSDT -> ETH).
+    const shortSym = (s) => {
+        for (let i = 0; i < QUOTES.length; i++) {
+            const q = QUOTES[i];
+            if (s.length > q.length && s.endsWith(q)) return s.slice(0, s.length - q.length);
+        }
+        return s;
+    };
+    const streamUrl = (s) => {
+        const l = s.toLowerCase();
+        return 'wss://stream.binance.com:9443/stream?streams=' + l + '@depth20@100ms/' + l + '@aggTrade/' + l + '@bookTicker';
+    };
 
-    (async () => {
-        let handle;
+    // Cache EVERY node ONCE at init -- no handler or refresh re-runs getElementById.
+    const el = {
+        mid: $('mid'), bid: $('bid'), ask: $('ask'), spread: $('spread'),
+        qps: $('qps'), trps: $('trps'), ladder: $('ladder'), zoomv: $('zoomv'),
+        readyz: $('readyz'), livez: $('livez'), restarts: $('restarts'), supstate: $('supstate'),
+        nodes: $('nodes'), rec: $('rec'), aggs: $('aggs'), cronmisc: $('cronmisc'),
+        wsstatus: $('wsstatus'), latency: $('latency'), attempts: $('attempts'),
+        dFeed: $('d-feed'), dReady: $('d-ready'), dLive: $('d-live'), heal: $('heal'),
+        log: $('log'), err: $('err'), zoom: $('zoom'), kill: $('kill'), replay: $('replay'),
+        source: $('source'), swap: $('swap'), shutdown: $('shutdown'),
+        tabs: $('tabs'), shutveil: $('shutveil'),
+    };
+
+    // Tab strip: a fixed pool of button elements built ONCE + a trailing +add button.
+    // renderTabs() mutates the pool in place (text/dataset/class) -- it never rebuilds
+    // the strip, so opening/closing a symbol is a handful of writes, no DOM churn.
+    const tabPool = [];
+    for (let i = 0; i < TAB_POOL; i++) {
+        const tab = document.createElement('button');
+        tab.className = 'tab hidden';
+        const symSpan = document.createElement('span');
+        symSpan.className = 'tab-sym';
+        const xSpan = document.createElement('span');
+        xSpan.className = 'tab-x';
+        xSpan.textContent = 'x';
+        tab.append(symSpan, xSpan);
+        el.tabs.appendChild(tab);
+        tabPool.push(tab);
+    }
+    const addBtn = document.createElement('button');
+    addBtn.className = 'tab-add';
+    addBtn.textContent = '+ add';
+    el.tabs.appendChild(addBtn);
+
+    // A single cached inline input reveals on +add (never createElement per click). Its
+    // handlers are wired ONCE here; Enter commits, Escape/blur cancel. Cached in `el`.
+    const addInput = document.createElement('input');
+    addInput.type = 'text';
+    addInput.className = 'tab-input hidden';
+    addInput.placeholder = 'symbol e.g. SOL';
+    addInput.maxLength = 16;
+    addInput.setAttribute('aria-label', 'add symbol');
+    el.tabs.appendChild(addInput);
+    el.addInput = addInput;
+
+    function showAddInput() {
+        el.addInput.value = '';
+        el.addInput.classList.remove('hidden');
+        el.addInput.focus();
+    }
+
+    function hideAddInput() {
+        el.addInput.value = '';
+        el.addInput.classList.add('hidden');
+    }
+
+    async function commitAdd(raw) {
+        if (!handle) return;
+        const sym = normalizeSymbol(raw);
+        if (!sym) {
+            pushLog('down', 'add: ignored -- empty symbol');
+            return;
+        }
+        await handle.addSymbol(sym, streamUrl(sym));    // kernel dedupes: already-open -> setActive
+        renderTabs();
+    }
+
+    el.addInput.addEventListener('keydown', async (e) => {
+        if (e.key === 'Enter') {
+            const raw = el.addInput.value;
+            hideAddInput();
+            await commitAdd(raw);
+        } else if (e.key === 'Escape') {
+            hideAddInput();
+        }
+    });
+    el.addInput.addEventListener('blur', () => hideAddInput());
+
+    function renderTabs() {
+        const syms = handle ? handle.symbols() : [];
+        const act = handle ? handle.activeSymbol() : null;
+        for (let i = 0; i < tabPool.length; i++) {
+            const tab = tabPool[i];
+            if (i < syms.length) {
+                const sym = syms[i];
+                tab.dataset.sym = sym;
+                tab.firstChild.textContent = shortSym(sym);
+                tab.classList.toggle('active', sym === act);
+                tab.classList.remove('hidden');
+            } else {
+                tab.dataset.sym = '';
+                tab.classList.add('hidden');
+            }
+        }
+    }
+
+    // One delegated listener for the whole strip (pooled tabs + the add button): no
+    // per-tab listener, no getElementById in the handler -- closest() reads the target.
+    el.tabs.addEventListener('click', async (e) => {
+        if (!handle) return;
+        if (e.target.closest('.tab-x')) {
+            const sym = e.target.closest('.tab').dataset.sym;
+            if (sym) {
+                await handle.closeSymbol(sym);
+                renderTabs();
+            }
+            return;
+        }
+        if (e.target.closest('.tab-add')) {
+            showAddInput();
+            return;
+        }
+        const tab = e.target.closest('.tab');
+        if (tab && tab.dataset.sym) {
+            handle.setActive(tab.dataset.sym);
+            renderTabs();
+        }
+    });
+
+    function setShutState(down) {
+        el.shutdown.textContent = down ? 'Boot kernel' : 'Shutdown kernel';
+        el.shutdown.dataset.state = down ? 'down' : 'up';
+        el.shutveil.classList.toggle('on', down);
+    }
+
+    // Boot flow (task 14): re-invokable so the Boot button restarts the kernel with the
+    // SAME ctx/gl. Sets the module-scope `handle`; the HUD + listeners read it live.
+    async function boot() {
+        size();
         try {
             handle = await bootKernel({ctx, gl, w: W, h: H, dpr, onEvent: pushLog, onMode: setMode});
         } catch (e) {
-            const err = $('err');
-            err.hidden = false;
-            err.textContent = 'kernel boot failed:\n' + (e && e.stack ? e.stack : String(e));
+            handle = null;
+            el.err.hidden = false;
+            el.err.textContent = 'kernel boot failed:\n' + (e && e.stack ? e.stack : String(e));
             console.error(e);
             return;
         }
-        pushLog('heal', 'kernel booted -- ' + handle.readState().nodeCount + ' graph nodes wired');
+        el.err.hidden = true;
+        curMode = '2d';
+        glc.classList.add('hidden');
+        cv.classList.remove('hidden');
+        setShutState(false);
+        pushLog('heal', 'boot: kernel re-registered -- ' + handle.readState().nodeCount + ' graph nodes wired');
+        renderTabs();
+    }
 
-        // Cache every HUD + control node ONCE -- no handler or refresh re-runs getElementById.
-        const el = {
-            mid: $('mid'), bid: $('bid'), ask: $('ask'), spread: $('spread'),
-            qps: $('qps'), trps: $('trps'), ladder: $('ladder'), zoomv: $('zoomv'),
-            readyz: $('readyz'), livez: $('livez'), restarts: $('restarts'), supstate: $('supstate'),
-            nodes: $('nodes'), rec: $('rec'), aggs: $('aggs'), cronmisc: $('cronmisc'),
-            wsstatus: $('wsstatus'), latency: $('latency'), attempts: $('attempts'),
-            dFeed: $('d-feed'), dReady: $('d-ready'), dLive: $('d-live'), heal: $('heal'),
-        };
+    // Listeners attached ONCE; each reads the live `handle` with a null guard.
+    window.addEventListener('resize', () => {
+        const s = size();
+        if (handle) handle.resize(s.W, s.H, dpr);
+    });
+    el.zoom.addEventListener('input', (e) => {
+        const z = parseFloat(e.target.value);
+        el.zoomv.textContent = z.toFixed(1) + 'x';   // cached node -- no lookup per drag frame
+        if (handle) handle.setZoom(z);
+    });
+    el.kill.addEventListener('click', () => {
+        if (handle) handle.killFeed();
+    });
+    el.replay.addEventListener('click', () => {
+        if (handle) handle.replay();
+    });
+    el.source.addEventListener('change', (e) => {
+        if (handle) handle.setSource(e.target.value);
+    });
+    el.swap.addEventListener('click', () => {
+        if (handle) handle.swapRenderer();
+    });
+    el.shutdown.addEventListener('click', async () => {
+        if (el.shutdown.dataset.state === 'down') {
+            await boot();
+            return;
+        }
+        if (handle) {
+            const h = handle;
+            handle = null;                              // stop the HUD reading a draining kernel
+            await h.shutdown();
+        }
+        setShutState(true);
+        renderTabs();
+    });
 
-        window.addEventListener('resize', () => {
-            const s = size();
-            handle.resize(s.W, s.H, dpr);
-        });
+    // HUD refresh (decoupled from the render loop; cached refs, null-guarded handle).
+    setInterval(() => {
+        if (!handle) return;
+        const s = handle.readState();
+        el.mid.textContent = fmt(s.mid);
+        el.bid.textContent = fmt(s.bid);
+        el.ask.textContent = fmt(s.ask);
+        el.spread.textContent = fmt(s.spread);
+        el.qps.textContent = s.qps;
+        el.trps.textContent = s.trps;
+        el.ladder.textContent = s.syntheticLadder ? 'SYNTH' : 'WIRE (' + s.levels + ' lvl)';
+        el.readyz.textContent = s.readyz;
+        el.livez.textContent = s.livez;
+        el.restarts.textContent = s.restarts;
+        el.supstate.textContent = SUP[s.supState] || s.supState;
+        el.nodes.textContent = s.nodeCount;
+        el.rec.textContent = s.recorded;
+        el.aggs.textContent = s.jobs.aggregations;
+        el.cronmisc.textContent = s.jobs.pruned + ' / ' + s.jobs.heartbeats;
+        el.wsstatus.textContent = s.status;
+        el.latency.textContent = s.latency >= 0 ? s.latency.toFixed(0) + 'ms' : '--';
+        el.attempts.textContent = s.attempts;
+        el.dFeed.className = 'dot ' + (s.open ? 'ok' : (s.status === 'closed' ? 'crit' : 'warn'));
+        el.dReady.className = 'dot ' + (s.readyz === 0 ? 'ok' : 'warn');
+        el.dLive.className = 'dot ' + (s.livez === 0 ? 'ok' : 'crit');
+        el.heal.classList.toggle('on', !s.open);
+    }, 120);
 
-        $('zoom').addEventListener('input', (e) => {
-            const z = parseFloat(e.target.value);
-            handle.setZoom(z);
-            el.zoomv.textContent = z.toFixed(1) + 'x';   // cached node -- no lookup on every drag frame
-        });
-        $('kill').addEventListener('click', () => handle.killFeed());
-        $('replay').addEventListener('click', () => handle.replay());
-        $('source').addEventListener('change', (e) => handle.setSource(e.target.value));
-
-        // HUD refresh (decoupled from the render loop; cached refs, no per-tick lookups)
-        setInterval(() => {
-            const s = handle.readState();
-            el.mid.textContent = fmt(s.mid);
-            el.bid.textContent = fmt(s.bid);
-            el.ask.textContent = fmt(s.ask);
-            el.spread.textContent = fmt(s.spread);
-            el.qps.textContent = s.qps;
-            el.trps.textContent = s.trps;
-            el.ladder.textContent = s.syntheticLadder ? 'SYNTH' : 'WIRE (' + s.levels + ' lvl)';
-            el.readyz.textContent = s.readyz;
-            el.livez.textContent = s.livez;
-            el.restarts.textContent = s.restarts;
-            el.supstate.textContent = SUP[s.supState] || s.supState;
-            el.nodes.textContent = s.nodeCount;
-            el.rec.textContent = s.recorded;
-            el.aggs.textContent = s.jobs.aggregations;
-            el.cronmisc.textContent = s.jobs.pruned + ' / ' + s.jobs.heartbeats;
-            el.wsstatus.textContent = s.status;
-            el.latency.textContent = s.latency >= 0 ? s.latency.toFixed(0) + 'ms' : '--';
-            el.attempts.textContent = s.attempts;
-            el.dFeed.className = 'dot ' + (s.open ? 'ok' : (s.status === 'closed' ? 'crit' : 'warn'));
-            el.dReady.className = 'dot ' + (s.readyz === 0 ? 'ok' : 'warn');
-            el.dLive.className = 'dot ' + (s.livez === 0 ? 'ok' : 'crit');
-            el.heal.classList.toggle('on', !s.open);
-        }, 120);
-    })();
+    boot();
 </script>
 </body>
 </html>
