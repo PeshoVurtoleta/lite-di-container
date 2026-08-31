@@ -10,6 +10,10 @@
       Pin-bump procedure: bump ONE line's version, hard-reload (empty cache), then
       re-run the acceptance gate (cold first-frame <= 3s, Blocked-Binance degrade
       log). Never bump the whole map blind.
+      lite-signal-decorators carries ?deps=@zakkster/lite-signal@1.5.0 so esm.sh hands
+      it the SAME lite-signal instance the app imports -- two instances would mean two
+      default registries and the A2 "default registry frozen" gate would be vacuous in
+      the browser (headless A2 is safe: one npm install, one instance).
     -->
     <script type="importmap">
 {
@@ -25,6 +29,7 @@
     "@zakkster/lite-di-signal":      "https://esm.sh/@zakkster/lite-di-signal@1.0.0",
     "@zakkster/lite-raf":            "https://esm.sh/@zakkster/lite-raf@1.2.0",
     "@zakkster/lite-signal":         "https://esm.sh/@zakkster/lite-signal@1.5.0",
+    "@zakkster/lite-signal-decorators": "https://esm.sh/@zakkster/lite-signal-decorators@1.5.0?deps=@zakkster/lite-signal@1.5.0",
     "@zakkster/lite-ws":             "https://esm.sh/@zakkster/lite-ws@1.0.0",
     "@zakkster/lite-ring-buffer":    "https://esm.sh/@zakkster/lite-ring-buffer@1.0.1",
     "@zakkster/lite-gl":             "https://esm.sh/@zakkster/lite-gl@2.0.0",
@@ -515,6 +520,7 @@
                 <div class="row"><span class="k">bid</span><span class="v" id="bid">--</span></div>
                 <div class="row"><span class="k">ask</span><span class="v" id="ask">--</span></div>
                 <div class="row"><span class="k">spread</span><span class="v" id="spread">--</span></div>
+                <div class="row"><span class="k">alert threshold <small>localTo</small></span><span class="v ember" id="alert">--</span></div>
                 <div class="row"><span class="k">quotes / s</span><span class="v" id="qps">--</span></div>
                 <div class="row"><span class="k">trades / s</span><span class="v" id="trps">--</span></div>
                 <div class="row"><span class="k">ladder</span><span class="v accent" id="ladder">--</span></div>
@@ -575,6 +581,8 @@
             </div>
             <div class="slider">zoom (or pinch) <input type="range" id="zoom" min="0.5" max="3" step="0.1" value="1"><span
                     id="zoomv" class="v">1.0x</span></div>
+            <button id="pin">Pin threshold</button>
+            <button id="unpin">Unpin (follow mid)</button>
             <button id="kill" class="danger">Kill feed &rarr; watch it self-heal</button>
             <button id="replay">Replay recorded session (event-bus)</button>
             <button id="swap">Swap renderer build (rebind, GAP-3)</button>
@@ -726,7 +734,8 @@
 
     // Cache EVERY node ONCE at init -- no handler or refresh re-runs getElementById.
     const el = {
-        mid: $('mid'), bid: $('bid'), ask: $('ask'), spread: $('spread'),
+        mid: $('mid'), bid: $('bid'), ask: $('ask'), spread: $('spread'), alert: $('alert'),
+        pin: $('pin'), unpin: $('unpin'),
         qps: $('qps'), trps: $('trps'), ladder: $('ladder'), zoomv: $('zoomv'),
         readyz: $('readyz'), livez: $('livez'), restarts: $('restarts'), supstate: $('supstate'),
         nodes: $('nodes'), rec: $('rec'), aggs: $('aggs'), cronmisc: $('cronmisc'),
@@ -927,6 +936,12 @@
     wrap.addEventListener('pointercancel', releasePointer);
     wrap.addEventListener('pointerout', releasePointer);
     wrap.addEventListener('lostpointercapture', releasePointer);   // capture dropped -> free the slot
+    el.pin.addEventListener('click', () => {
+        if (handle) handle.pinAlert();
+    });
+    el.unpin.addEventListener('click', () => {
+        if (handle) handle.unpinAlert();
+    });
     el.kill.addEventListener('click', () => {
         if (handle) handle.killFeed();
     });
@@ -981,6 +996,7 @@
         el.bid.textContent = fmt(s.bid);
         el.ask.textContent = fmt(s.ask);
         el.spread.textContent = fmt(s.spread);
+        el.alert.textContent = s.pinned ? fmt(s.alert) + ' (pinned)' : fmt(s.alert) + ' (follow)';
         el.qps.textContent = s.burstActive ? s.qps + ' (burst)' : s.qps;
         el.trps.textContent = s.trps;
         el.ladder.textContent = s.syntheticLadder ? 'SYNTH' : 'WIRE (' + s.levels + ' lvl)';

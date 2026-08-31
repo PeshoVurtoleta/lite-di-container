@@ -19,8 +19,9 @@ import {Ticker} from '@zakkster/lite-di-ticker';
 import {Supervisor, STRATEGIES} from '@zakkster/lite-di-supervisor';
 import {Health, LANES} from '@zakkster/lite-di-health';
 import {fromContainer, toJSON, toDOT, toChromeTrace} from '@zakkster/lite-di-graph';
-import {createSignalScope, SIGNAL_REGISTRY_TOKEN} from '@zakkster/lite-di-signal';
+import {createSignalScope, reactiveService, SIGNAL_REGISTRY_TOKEN} from '@zakkster/lite-di-signal';
 import {createRegistry} from '@zakkster/lite-signal';
+import {defineReactive, disposeReactive, costOf, capacityFor} from '@zakkster/lite-signal-decorators';
 import {createSocketFactory} from '@zakkster/lite-ws';
 import {RingBuffer} from '@zakkster/lite-ring-buffer';
 import {TAG_QUOTE, TAG_DEPTH, TAG_TRADE, MAXLVL, parseFrame, OrderBook} from './Frames.js';
@@ -99,22 +100,77 @@ const SOURCES = {
 };
 const FEED_URL = SOURCES.BTCUSDT;
 
-// A FEW aggregates via lite-di-signal (a scoped registry wired into container teardown).
-class Aggregates {
-    constructor(rx) {
-        this.mid = rx.signal(0);
-        this.bid = rx.signal(0);
-        this.ask = rx.signal(0);
-        this.spread = rx.computed(() => this.ask() - this.bid());
-        this.tps = rx.signal(0);
-    }
+// The per-symbol reactive view-model, built by lite-signal-decorators' defineReactive on
+// the scope's OWN lite-signal registry (never the default -- see makeSymbolVM). ONE frozen
+// module-level spec, allocated once at load and shared by every scope's fresh base class.
+// Ten reactive nodes per instance: 1 anchor + 5 signals + 1 local + 2 deriveds + 1 effect.
+//   - signals: bid/ask/last are the live quote; pinned/pinAnchor drive the alert local.
+//   - deriveds: mid + spread (lazy, cascade-disposed with the anchor).
+//   - locals.alert: upstream-keyed (@localCopy flavor -- NO initial), so the threshold
+//     FOLLOWS live mid until a UI write pins it. The source reads the mid FORMULA over the
+//     raw signals (bid+ask)/2, NOT the `mid` derived: a localCopy seeds its upstream during
+//     wiring, before deriveds exist, so reading the derived there is a named throw. Same
+//     value, seed-safe. Pinning freezes the tracked upstream to the constant pinAnchor.
+//   - effects.onQuote: [HOT] three tracked reads + one plain-field store. frameDirty is a
+//     NON-reactive own field (a reactive write here would re-enter the effect); the body
+//     never touches draw/ctx/document -- the effect dirty-marks, the frame renders.
+const SYMBOL_VM_SPEC = Object.freeze({
+    signals: {bid: 0, ask: 0, last: 0, pinned: false, pinAnchor: 0},
+    deriveds: {
+        mid: (self) => (self.bid + self.ask) / 2,
+        spread: (self) => self.ask - self.bid,
+    },
+    locals: {
+        alert: {source: (self) => (self.pinned ? self.pinAnchor : (self.bid + self.ask) / 2)},
+    },
+    effects: {
+        onQuote: (self) => { self.mid; self.spread; self.alert; self.frameDirty = true; },
+    },
+});
+export {SYMBOL_VM_SPEC};
 
-    apply(t) {
-        this.mid.set(t.mid);
-        this.bid.set(t.bid);
-        this.ask.set(t.ask);
+// Cold, once per scope. A FRESH base class every call is REQUIRED: defineReactive installs
+// on Class.prototype and a second call on the same prototype is a spec-collision throw. The
+// constructor takes ZERO arguments -- costOf probes with no args and S9's createFleet depends
+// on it. host:{registry} binds the whole chain (and disposeReactive) to the scope registry.
+export function makeSymbolVM(registry) {
+    // Fail closed: without a registry defineReactive falls through to lite-signal's DEFAULT
+    // registry, silently landing the VM's 10 nodes on the shared default and breaking the A2
+    // isolation invariant. null is not zero -- an absent scope registry is an error, not a default.
+    if (!registry) throw new TypeError('makeSymbolVM: a scope registry is required (refusing the default registry)');
+    class SymbolVMBase {
+        frameDirty = false;
+        dispose() { disposeReactive(this); }
     }
+    return defineReactive(SymbolVMBase, {host: {registry}, ...SYMBOL_VM_SPEC});
 }
+
+// Module-load validation probe (mitigates defineReactive's PENDING-poisoning: a throw
+// between the push and applyReactiveHost would leave recs in the module array for the next
+// claim). Building + costing ONE throwaway VM at load makes a per-scope spec failure
+// structurally impossible and PROVES the 10-node count before any scope opens. costOf's two
+// probes agree here because the alert branch is data-independent at the unpinned floor.
+const _probeReg = createRegistry({maxNodes: 64, maxLinks: 128, prealloc: 'eager', onCapacityExceeded: 'throw'});
+const _ProbeVM = makeSymbolVM(_probeReg);
+const VM_COST = costOf(_ProbeVM);
+if (VM_COST.nodes !== 10) {
+    throw new Error('SymbolVM spec drift: expected 10 reactive nodes, measured ' + VM_COST.nodes);
+}
+// Per-scope registry sizing (fail closed): capacityFor sizes the VM EXACTLY (eager + throw),
+// then MEASURED kernel-signal headroom is added -- one tps signal + lite-ws lifecycle (3
+// signals per socket, released on socket dispose) + heal/churn slack. Forwarded verbatim
+// through createSignalScope's options passthrough to createRegistry.
+const _VM_CFG = capacityFor([[_ProbeVM, 1]]);
+const KERNEL_SIGNAL_HEADROOM = 16;   // tps(1) + ws lifecycle(3/socket) + heal/overlap slack
+const KERNEL_LINK_HEADROOM = 8;
+const SCOPE_REGISTRY_CONFIG = Object.freeze({
+    createRegistry,
+    maxNodes: _VM_CFG.maxNodes + KERNEL_SIGNAL_HEADROOM,
+    maxLinks: _VM_CFG.maxLinks + KERNEL_LINK_HEADROOM,
+    prealloc: 'eager',
+    onCapacityExceeded: 'throw',
+});
+_probeReg.destroy();
 
 // Simulation feed. Duck-types the exact lite-ws surface the render loop pulls
 // (status/isOpen/latency/reconnectAttempts/poll/dispose), so `makeSocket` resolves it
@@ -195,12 +251,14 @@ class TapeApply {
 }
 
 class AggApply {
-    constructor(agg) {
-        this.agg = agg;
+    constructor(vm) {
+        this.vm = vm;
     }
 
-    handle(f) {
-        this.agg.apply(f);
+    handle(f) {                                        // [HOT] three plain accessor stores, no alloc
+        this.vm.bid = f.bid;
+        this.vm.ask = f.ask;
+        this.vm.last = f.mid;
     }
 }
 
@@ -433,7 +491,7 @@ class PerfJob {
 // S5 burst stress: a [HOT] pre-lane system, DISABLED by default (ticker.enable('burst',
 // false) -> not called at all, so there is no dead branch in any hot body). When enabled it
 // injects burstN synthetic ticks per frame straight into the ACTIVE scope's dispatch seam
-// (tape + agg + bus + traceBus + counters) via an integer-LCG walk on the last real mid.
+// (tape + vm + bus + traceBus + counters) via an integer-LCG walk on the last real mid.
 // Zero allocation per synthetic tick: scope.inject mutates one reused scope-owned frame.
 class BurstSystem {
     constructor(viz) {
@@ -448,7 +506,7 @@ class BurstSystem {
         const inject = a.inject;
         if (!inject) return;
         const n = v.burstN;
-        const base = a.agg.mid();                  // last real mid, read ONCE outside the loop
+        const base = a.vm.mid;                     // last real mid (derived), read ONCE outside the loop
         let s = this.seed;
         for (let i = 0; i < n; i++) {
             s = (Math.imul(s, 1664525) + 1013904223) | 0;   // integer LCG walk
@@ -792,7 +850,7 @@ class GLRendererV2 extends GLRenderer {
 }
 
 // ticker system [HOT]: pulls the ACTIVE scope's socket once per frame, then selects +
-// draws. deps ['viz'] ONLY -- the per-symbol book/tape/agg/feed live behind the single
+// draws. deps ['viz'] ONLY -- the per-symbol book/tape/vm/feed live behind the single
 // pre-allocated `viz.active` holder, mutated on tab switch (cold). No c.get, no literal,
 // no closure in this body; a background symbol's ingest is pumped by its own PollJob.
 // S4 Phase B (temporary, S5 hands these to the perf panel): compute p50/p99 over the
@@ -817,6 +875,8 @@ class RenderSystem {
         if (!v.router || !v.ctx) return;
         const a = v.active;
         if (!a) return;                                     // no live symbol -> idle
+        const vm = a.vm;                                    // consume the effect's per-quote dirty marker
+        if (vm && vm.frameDirty) vm.frameDirty = false;     // (A5): draw stays UNCONDITIONAL below -- never a render gate
         a.feedPoll();                                       // active scope: wake its socket
         const n = a.tape.count;
         // S4 Phase B timer (temporary, flag-gated by v.measure; off = only these bytes).
@@ -845,20 +905,19 @@ class RenderSystem {
     }
 }
 
-// rx primitives bound to a scope's OWN registry (cold, per-scope setup).
-function rxOf(sc) {
-    const reg = sc.get(SIGNAL_REGISTRY_TOKEN);
-    return {signal: reg.signal.bind(reg), computed: reg.computed.bind(reg)};
-}
-
-// Per-symbol child scope (finding 7). Each symbol owns feed / book / tape / agg +
+// Per-symbol child scope (finding 7). Each symbol owns feed / book / tape / vm +
 // its OWN lite-di-signal registry, its OWN object bus + numeric trace recorder, and
 // its OWN supervisor/health so killing one feed faults ONE scope. The registry is
 // created via createSignalScope (eager -> _resolutionOrder[0]) so it tears down LAST.
 // Cold factory: everything here runs once, at tab open, never per frame.
 function createSymbolScope(parent, {symbol, url, log, faulty, ringSize, socketFactory}) {
-    const s = createSignalScope(parent, {createRegistry});   // registry pinned first, torn down last
+    const s = createSignalScope(parent, SCOPE_REGISTRY_CONFIG);   // registry pinned first (eager+throw), torn down last
     const scopeReg = s.get(SIGNAL_REGISTRY_TOKEN);
+
+    // Per-scope rate aggregate: ONE scoped signal, deliberately OUTSIDE the VM's 10 nodes
+    // (tps is not a quote field). A raw registry signal (not a container binding) -- torn
+    // down by registry.destroy with the rest. Written by ratectl.sample, read by state().
+    const tpsSig = scopeReg.signal(0);
 
     // OBSERVED teardown order (not a constant): each real disposable's onTeardown appends
     // its name here AS THE CONTAINER FIRES IT, so the narrated walk reflects the true
@@ -866,14 +925,18 @@ function createSymbolScope(parent, {symbol, url, log, faulty, ringSize, socketFa
     // that is what makes the S6 teardown gate able to go RED (a hardcoded order cannot).
     const teardownWalk = [];
 
-    // tape / book / agg / trade rings are singleton(Factory) -- NEVER value: a VALUE
+    // tape / book / vm / trade rings are singleton(Factory) -- NEVER value: a VALUE
     // returns before the isCached block (Container.js:237) so it is never in the
     // resolution order and never torn down or counted. Anything that must appear in
     // the teardown walk is a singleton.
     s.value('symbol', symbol);
     s.singletonFactory('tape', () => new RingBuffer(ringSize));
     s.singleton('book', OrderBook);
-    s.singletonFactory('agg', (sc) => new Aggregates(rxOf(sc)));
+    // The reactive VM, built on the scope's OWN registry (api.registry, NEVER the parent).
+    // reactiveService auto-wires onTeardown('vm', svc => svc.dispose()) because the base
+    // class exposes dispose() -- so vm.dispose() runs during the reverse walk, while the
+    // registry (resolution index 0) is still live, and registry.destroy() drains last.
+    reactiveService(s, 'vm', (api) => new (makeSymbolVM(api.registry))());
     s.singletonFactory('trades:px', () => new RingBuffer(TRADE_RING));
     s.singletonFactory('trades:side', () => new RingBuffer(TRADE_RING));
 
@@ -884,7 +947,7 @@ function createSymbolScope(parent, {symbol, url, log, faulty, ringSize, socketFa
     // their onTeardown -> dispose() actually fires (risk 4): a VALUE would leak the
     // recorder ring across the 50x churn gate (G2).
     const bus = new EventBus(s);
-    bus.on('tick', TapeApply, ['tape']).on('tick', AggApply, ['agg'])
+    bus.on('tick', TapeApply, ['tape']).on('tick', AggApply, ['vm'])
         .on('trade', TradeApply, ['trades:px', 'trades:side']);
     s.singletonFactory('bus', () => bus);
     s.onTeardown('bus', (b) => {
@@ -909,7 +972,8 @@ function createSymbolScope(parent, {symbol, url, log, faulty, ringSize, socketFa
     // per-scope feed lifecycle + counters (all scope-local, no module globals)
     let feedUrl = url, sock = null;
     let quoteCount = 0, depthCount = 0, tradeCount = 0, qps = 0, trps = 0, lastQ = 0, lastT = 0;
-    let book = null, tape = null, agg = null, tradePx = null, tradeSide = null;
+    let book = null, tape = null, vm = null, tradePx = null, tradeSide = null;
+    let alertResetPending = false;                            // set on unpin, cleared on the reset-logging quote
 
     // Single cold dispatch seam (the ONLY place the wire tag is inspected). book is
     // assigned after boot; dispatch runs only after sup.start() opens the socket.
@@ -932,10 +996,18 @@ function createSymbolScope(parent, {symbol, url, log, faulty, ringSize, socketFa
                 tradeCount++;
                 break;
         }
+        // After an unpin, the FIRST quote whose upstream actually moved swings the alert
+        // local back to mid (upstream-keyed). Log that reset ONCE. If the quote's mid
+        // returned to the last-adopted value (the ABA case), alert stays stale and this
+        // stays pending -- honest, per the localTo contract. Gated: false in steady state.
+        if (alertResetPending && vm && vm.alert === vm.mid) {
+            alertResetPending = false;
+            log('heal', 'localTo: upstream moved -> alert threshold reset to mid (upstream-keyed)');
+        }
     };
 
     // S5 burst: ONE reused scope-owned scratch frame (S2's tagged-scratch rule). inject()
-    // mutates it and calls the SAME dispatch() seam a real QUOTE tick takes, so tape / agg /
+    // mutates it and calls the SAME dispatch() seam a real QUOTE tick takes, so tape / vm /
     // bus / traceBus / quoteCount all advance identically. Zero allocation per call.
     const burstFrame = {tag: TAG_QUOTE, bid: 0, ask: 0, mid: 0, t: 0};
     const inject = (mid, bid, ask) => {
@@ -977,10 +1049,17 @@ function createSymbolScope(parent, {symbol, url, log, faulty, ringSize, socketFa
         throw new Error('injected teardown fault (?faultyTeardown)');
     });
 
-    // Registry narration hook: appends 'signal-registry' when createSignalScope's pinned
-    // registry is torn down (LAST, reverse of its index-0 resolve). Narration only -- the
-    // registry's own destroy is wired by createSignalScope; this observes the fire.
-    s.onTeardown(SIGNAL_REGISTRY_TOKEN, () => teardownWalk.push('signal-registry'));
+    // Registry narration: createSignalScope already wired onTeardown(TOKEN, reg => reg.destroy())
+    // at scope creation. A SECOND onTeardown on the SAME token would CLOBBER it -- the container's
+    // _teardowns is a Map (last write wins, Container.js), so the destroy would silently never run
+    // and the registry would leak (narrated "destroyed" while still live). So narrate by WRAPPING
+    // the registry's own destroy: the wrap pushes 'signal-registry' then runs the real destroy,
+    // both firing at the registry's teardown position (LAST, reverse of its index-0 resolve).
+    const realRegDestroy = scopeReg.destroy.bind(scopeReg);
+    scopeReg.destroy = () => {
+        teardownWalk.push('signal-registry');
+        return realRegDestroy();
+    };
 
     const refreshFeed = () => {
         try {
@@ -1031,7 +1110,7 @@ function createSymbolScope(parent, {symbol, url, log, faulty, ringSize, socketFa
             lastQ = q;
             trps = tradeCount - lastT;
             lastT = tradeCount;
-            if (agg) agg.tps.set(qps);
+            tpsSig.set(qps);
         },
     };
     s.value('ratectl', ratectl);
@@ -1064,10 +1143,11 @@ function createSymbolScope(parent, {symbol, url, log, faulty, ringSize, socketFa
     bus.boot();
     traceBus.boot();
     // Eager resolve in an order that makes the reverse teardown read
-    // feed -> agg -> tape -> book -> signal-registry (registry is index 0).
+    // feed -> vm -> tape -> book -> signal-registry (registry is index 0). Resolving 'vm'
+    // AFTER the registry guarantees vm.dispose() fires before registry.destroy() (task 5).
     book = s.get('book');
     tape = s.get('tape');
-    agg = s.get('agg');
+    vm = s.get('vm');
     tradePx = s.get('trades:px');
     tradeSide = s.get('trades:side');
     s.get('bus');
@@ -1082,7 +1162,7 @@ function createSymbolScope(parent, {symbol, url, log, faulty, ringSize, socketFa
 
     return {
         symbol, scope: s, nodeCount,
-        book, tape, agg, tradePx, tradeSide, feedPoll, inject,
+        book, tape, vm, tradePx, tradeSide, feedPoll, inject,
         sup,                                             // test seam (S6): heal.test.mjs reaches the per-scope supervisor to reportFault
         async start() {
             await sup.start();                               // resolves 'feed' -> opens the socket
@@ -1103,12 +1183,26 @@ function createSymbolScope(parent, {symbol, url, log, faulty, ringSize, socketFa
                 }
             }
             return {
-                mid: agg.mid(), bid: agg.bid(), ask: agg.ask(), spread: agg.spread(), qps, trps,
+                mid: vm.mid, bid: vm.bid, ask: vm.ask, spread: vm.spread, qps: tpsSig(), trps,
+                alert: vm.alert, pinned: vm.pinned,
                 levels: book ? book.n : 0, syntheticLadder: book ? book.synthetic : true,
                 readyz: health.readyz(), livez: health.livez(), supState: sup.state, restarts,
                 recorded: traceBus.recorded(), status, latency, attempts, open,
                 ticks: quoteCount + depthCount + tradeCount,
             };
+        },
+        // Alert threshold pin/unpin (cold, one click per intent). Pin freezes the tracked
+        // upstream to the constant pinAnchor so the local override survives every mid move;
+        // unpin swings upstream back to mid -> the next moved quote resets (dispatch logs it).
+        pinAlert() {
+            vm.pinAnchor = vm.mid;
+            vm.pinned = true;
+            vm.alert = vm.mid;
+            alertResetPending = false;
+        },
+        unpinAlert() {
+            vm.pinned = false;
+            alertResetPending = true;
         },
         setSource(u) {
             failover.armed = false;                          // a manual choice disarms the watchdog for good
@@ -1151,7 +1245,11 @@ function createSymbolScope(parent, {symbol, url, log, faulty, ringSize, socketFa
                 walk += (i ? ' -> ' : '') + step + (failed.indexOf(step) !== -1 ? ' (failed)' : '');
             }
             log('down', 'scope: ' + symbol + ' closed -- teardown: ' + walk);
-            log('down', 'scope: ' + symbol + ' registry destroyed -- ' + regNodes + ' reactive nodes released');
+            // One coherent teardown line for the reactive plane (task 12): the SymbolVM's
+            // node count (proven at boot) plus the scoped registry's live count before
+            // destroy. Merged with the registry line -- never double-narrated.
+            log('down', 'teardown[' + symbol + ']: SymbolVM disposed (' + VM_COST.nodes
+                + ' nodes) + scoped registry destroyed (' + regNodes + ' reactive nodes released) -- scope gone');
         },
     };
 }
@@ -1216,7 +1314,7 @@ export async function bootKernel({ctx, gl, w, h, dpr, onEvent, onMode, ringSize,
 
     // The single pre-allocated active-symbol holder. Mutated on tab switch (cold);
     // read by RenderSystem.update() every frame, never re-allocated.
-    const activeHolder = {book: null, tape: null, agg: null, feedPoll: null, tradePx: null, tradeSide: null, inject: null};
+    const activeHolder = {book: null, tape: null, vm: null, feedPoll: null, tradePx: null, tradeSide: null, inject: null};
 
     const c = new Container();
     c.value('viz', viz);
@@ -1310,7 +1408,7 @@ export async function bootKernel({ctx, gl, w, h, dpr, onEvent, onMode, ringSize,
             // Drop references to the drained scope so the holder pins nothing (G2).
             activeHolder.book = null;
             activeHolder.tape = null;
-            activeHolder.agg = null;
+            activeHolder.vm = null;
             activeHolder.feedPoll = null;
             activeHolder.tradePx = null;
             activeHolder.tradeSide = null;
@@ -1320,7 +1418,7 @@ export async function bootKernel({ctx, gl, w, h, dpr, onEvent, onMode, ringSize,
         activeSymbol = sym;
         activeHolder.book = h.book;
         activeHolder.tape = h.tape;
-        activeHolder.agg = h.agg;
+        activeHolder.vm = h.vm;
         activeHolder.feedPoll = h.feedPoll;
         activeHolder.tradePx = h.tradePx;
         activeHolder.tradeSide = h.tradeSide;
@@ -1381,6 +1479,7 @@ export async function bootKernel({ctx, gl, w, h, dpr, onEvent, onMode, ringSize,
                 symbol: activeSymbol, symbols: scopes.size, nodeCount, jobs: stats,
                 gpuBuild: gpuV2 ? 'v2' : 'v1',
                 mid: 0, bid: 0, ask: 0, spread: 0, qps: 0, trps: 0, levels: 0,
+                alert: 0, pinned: false,
                 syntheticLadder: true, readyz: 1, livez: 1, supState: 0, restarts: 0,
                 recorded: 0, status: 'closed', latency: -1, attempts: 0, open: false, ticks: 0,
                 // S5 perf (global, not per-scope): p99/worst/fps/long-tasks/heap/uptime/burst.
@@ -1395,6 +1494,8 @@ export async function bootKernel({ctx, gl, w, h, dpr, onEvent, onMode, ringSize,
             base.bid = st.bid;
             base.ask = st.ask;
             base.spread = st.spread;
+            base.alert = st.alert;
+            base.pinned = st.pinned;
             base.qps = st.qps;
             base.trps = st.trps;
             base.levels = st.levels;
@@ -1476,6 +1577,14 @@ export async function bootKernel({ctx, gl, w, h, dpr, onEvent, onMode, ringSize,
         replay() {
             const h = active();
             return h ? h.replay() : 0;
+        },
+        pinAlert() {
+            const h = active();
+            if (h) h.pinAlert();
+        },
+        unpinAlert() {
+            const h = active();
+            if (h) h.unpinAlert();
         },
         swapRenderer,
         addSymbol,

@@ -12,19 +12,20 @@
   },
   "dependencies": {
     "@zakkster/lite-di-container": "2.2.0",
-    "@zakkster/lite-di-event-bus": "1.1.0",
-    "@zakkster/lite-di-strategies": "1.0.0",
     "@zakkster/lite-di-cron": "1.0.0",
-    "@zakkster/lite-di-ticker": "1.0.0",
-    "@zakkster/lite-di-supervisor": "1.0.0",
-    "@zakkster/lite-di-health": "1.0.0",
+    "@zakkster/lite-di-event-bus": "1.1.0",
     "@zakkster/lite-di-graph": "1.0.0",
+    "@zakkster/lite-di-health": "1.0.0",
     "@zakkster/lite-di-signal": "1.0.0",
+    "@zakkster/lite-di-strategies": "1.0.0",
+    "@zakkster/lite-di-supervisor": "1.0.0",
+    "@zakkster/lite-di-ticker": "1.0.0",
+    "@zakkster/lite-gl": "2.0.0",
     "@zakkster/lite-raf": "1.2.0",
-    "@zakkster/lite-signal": "1.5.0",
-    "@zakkster/lite-ws": "1.0.0",
     "@zakkster/lite-ring-buffer": "1.0.1",
-    "@zakkster/lite-gl": "2.0.0"
+    "@zakkster/lite-signal": "1.5.0",
+    "@zakkster/lite-signal-decorators": "1.5.0",
+    "@zakkster/lite-ws": "1.0.0"
   },
   "devDependencies": {
     "@zakkster/lite-gc-profiler": "^1.15.0",

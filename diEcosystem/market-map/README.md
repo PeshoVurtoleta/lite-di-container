@@ -102,7 +102,7 @@ pin-bump procedure).
 
 ## What each package does here
 
-One row per import-map entry in `index.html` (15 specifiers). The **Version** column
+One row per import-map entry in `index.html` (16 specifiers). The **Version** column
 is the exact CDN pin -- the import map is the single source of truth.
 
 | Package | Version | Role in the demo |
@@ -118,6 +118,7 @@ is the exact CDN pin -- the import map is the single source of truth.
 | `lite-di-signal` | 1.0.0 | the reactive control surface -- a **handful** of aggregates (mid / bid / ask / spread), NOT one signal per tick |
 | `lite-raf` | 1.2.0 | the `requestAnimationFrame` frame source under `lite-di-ticker` (fails closed with no global rAF) |
 | `lite-signal` | 1.5.0 | the underlying reactive cell primitive the aggregate signals are built on |
+| `lite-signal-decorators` | 1.5.0 | `defineReactive` builds each symbol scope's 10-node view-model (bid/ask/last -> mid/spread deriveds + a `localTo` alert) on the scope's OWN registry; disposed with the scope |
 | **`lite-ws`** | 1.0.0 | the **real WebSocket feed**: `onMessage` pipes each decoded frame to the bus (0-GC), while `status` / `latency` / `reconnectAttempts` stay coarse reactive signals; built-in reconnect + backoff. Selectable at runtime between a **live Binance combined stream** (default; `@depth20@100ms` + `@aggTrade` + `@bookTicker` over wss, no auth), an **in-page simulation** (synthetic random walk, the supervised failover), and the local `feed-server` |
 | **`lite-ring-buffer`** | 1.0.1 | the pow2, bitmask-wrap `Float32Array` tick ring -- the 0-GC hot data the firehose lands in |
 | **`lite-gl`** | 2.0.0 | instanced WebGL2 renderer: the tick cloud via `createPointSink` **and the depth ladder via `createQuadSink`** (the whole order book on the GPU); scales to ~1M primitives |
@@ -176,6 +177,19 @@ live socket is unreachable, never presented as real data. With **local** selecte
 ladder is driven from real depth arrays (HUD reads **WIRE**) even though the underlying
 numbers are synthetic; only the live Binance feed is real market data. Either way it shows
 the **architecture and package composition** at real firehose rates -- not a trading system.
+
+The **alert threshold** row is a `@localTo` member of the per-symbol reactive VM
+(`@zakkster/lite-signal-decorators`): unpinned it follows live mid, pinned it freezes to a
+constant anchor. Its reset carries a shipped, documented ABA contract, quoted verbatim from
+`SignalDecorators.d.ts`:
+
+> The ABA contract (shipped, documented): the reset requires the upstream to
+> change relative to the last adoption, not to have merely moved -- upstream
+> A -> local write X -> upstream B -> upstream back to an equals-A value shows
+> the STALE local X.
+
+In this demo that means: unpinning while mid has returned to an `Object.is`-equal value
+keeps the stale pinned threshold -- visible, documented, not a bug.
 
 ## Perf & exports
 
