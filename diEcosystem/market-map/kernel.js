@@ -18,7 +18,7 @@ import {Cron, interval} from '@zakkster/lite-di-cron';
 import {Ticker} from '@zakkster/lite-di-ticker';
 import {Supervisor, STRATEGIES} from '@zakkster/lite-di-supervisor';
 import {Health, LANES} from '@zakkster/lite-di-health';
-import {fromContainer, toJSON} from '@zakkster/lite-di-graph';
+import {fromContainer, toJSON, toDOT, toChromeTrace} from '@zakkster/lite-di-graph';
 import {createSignalScope, SIGNAL_REGISTRY_TOKEN} from '@zakkster/lite-di-signal';
 import {createRegistry} from '@zakkster/lite-signal';
 import {createSocketFactory} from '@zakkster/lite-ws';
@@ -46,6 +46,13 @@ const DEPTH_BID_R = 0.306, DEPTH_BID_G = 0.906, DEPTH_BID_B = 0.82;
 // 2D cumulative-depth curve fills (hex-first per demo CSS law is inline-only; canvas takes rgba).
 const CURVE_BID = 'rgba(78,231,210,0.12)';
 const CURVE_ASK = 'rgba(245,166,35,0.12)';
+// S5 perf panel. A pow2 frame-delta ring (bitmask wrap, house pattern); the percentile
+// window is the newest PERF_WINDOW samples out of it. The histogram covers 0..128 ms at
+// HIST_MS resolution (clamp-to-last bucket) -- a provably alloc-free p99, no sort.
+const PERF_RING = 1024;            // frame-delta ring (pow2, bitmask wrap)
+const PERF_WINDOW = 600;           // percentile window (newest 600 samples)
+const HIST_BUCKETS = 512;          // 512 * 0.25 ms = 0..128 ms
+const HIST_MS = 0.25;              // histogram bucket resolution (ms)
 
 // Snap n to a power of two within [RING_MIN, RING_MAX]. Fail closed on a bad override.
 function clampRing(n) {
@@ -325,6 +332,129 @@ class LabelCache {
             this.s[i] = value.toFixed(1);
         }
         return this.s[i];
+    }
+}
+
+// S5 perf counters (pure, DOM-free -- headless-testable). A pow2 frame-delta ring plus a
+// Uint32 histogram for a provably alloc-free p99. All state preallocated in the ctor: no
+// object literal, array, closure, or Math.* call leaks into the hot body. sample() is
+// [HOT] (per frame, post lane); computeP99() is COLD (1 Hz). Fail closed: a non-finite
+// timestamp is SKIPPED (never recorded as 0); longTasks stays -1 (=> HUD "n/a") until the
+// observer is feature-proven; heapMB stays null (=> "n/a") when performance.memory absent.
+// null is NOT zero. Exported so qa can unit-test sample()/computeP99() headless (the S6
+// seam) IF a resolver for the esm.sh specifiers is available -- see the headless note below.
+export class PerfCounters {
+    constructor() {
+        this.d = new Float32Array(PERF_RING);
+        this.head = 0;
+        this.filled = 0;
+        this.hist = new Uint32Array(HIST_BUCKETS);
+        this.frames = 0;
+        this.worst = 0;
+        this.p99 = 0;
+        this.fps = 0;
+        this.lastTime = 0;
+        this.longTasks = -1;                       // -1 = longtask observer unsupported
+        this.longWorst = 0;
+        this.heapMB = null;                        // null = performance.memory absent
+        this.bootAt = 0;
+    }
+
+    // [HOT] one frame delta -> ring + worst + frame count. Nine scalar ops, zero alloc.
+    sample(time) {
+        if (!Number.isFinite(time)) return;        // fail closed: skip, never record 0
+        const dt = time - this.lastTime;
+        this.lastTime = time;
+        this.d[this.head] = dt;
+        this.head = (this.head + 1) & (PERF_RING - 1);
+        if (this.filled < PERF_RING) this.filled++;
+        if (dt > this.worst) this.worst = dt;
+        this.frames++;
+    }
+
+    // COLD (1 Hz): bucket the newest window into the histogram and read p99, then roll the
+    // fps window. No sort, no scratch array, no comparator -- the only alloc-free percentile.
+    computeP99() {
+        const hist = this.hist;
+        hist.fill(0);
+        let n = this.filled;
+        if (n > PERF_WINDOW) n = PERF_WINDOW;
+        const last = HIST_BUCKETS - 1;
+        let idx = this.head;
+        for (let i = 0; i < n; i++) {
+            idx = (idx - 1) & (PERF_RING - 1);     // walk backwards from newest
+            let b = (this.d[idx] / HIST_MS) | 0;
+            if (b < 0) b = 0; else if (b > last) b = last;
+            hist[b]++;
+        }
+        const target = Math.ceil(n * 0.99);
+        let cum = 0, bkt = 0;
+        for (let b = 0; b < HIST_BUCKETS; b++) {
+            cum += hist[b];
+            if (cum >= target) {
+                bkt = b;
+                break;
+            }
+        }
+        this.p99 = n > 0 ? (bkt + 1) * HIST_MS : 0;
+        this.fps = this.frames;
+        this.frames = 0;
+    }
+}
+
+// S5: a SEPARATE post-lane system (never a branch inside RenderSystem), so the render hot
+// body stays byte-identical to S4. Measures the frame AFTER RenderSystem in the same tick.
+class PerfSystem {
+    constructor(perf) {
+        this.perf = perf;
+    }
+
+    update(dt, time) {                             // [HOT]
+        this.perf.sample(time);
+    }
+}
+
+// S5: 1 Hz perf roll on the EXISTING top-level cron (no second timer / no stray setInterval).
+// Rolls the p99 window + fps, then samples the heap (Chrome-only, coarse; null off-Chrome).
+class PerfJob {
+    constructor(perf) {
+        this.perf = perf;
+    }
+
+    run() {
+        this.perf.computeP99();
+        const pm = typeof performance !== 'undefined' ? performance.memory : undefined;
+        this.perf.heapMB = (pm && typeof pm.usedJSHeapSize === 'number') ? pm.usedJSHeapSize / 1048576 : null;
+    }
+}
+
+// S5 burst stress: a [HOT] pre-lane system, DISABLED by default (ticker.enable('burst',
+// false) -> not called at all, so there is no dead branch in any hot body). When enabled it
+// injects burstN synthetic ticks per frame straight into the ACTIVE scope's dispatch seam
+// (tape + agg + bus + traceBus + counters) via an integer-LCG walk on the last real mid.
+// Zero allocation per synthetic tick: scope.inject mutates one reused scope-owned frame.
+class BurstSystem {
+    constructor(viz) {
+        this.viz = viz;
+        this.seed = 0x9e3779b1 | 0;                // LCG state (integer)
+    }
+
+    update() {                                     // [HOT] (only while enabled)
+        const v = this.viz;
+        const a = v.active;
+        if (!a) return;
+        const inject = a.inject;
+        if (!inject) return;
+        const n = v.burstN;
+        const base = a.agg.mid();                  // last real mid, read ONCE outside the loop
+        let s = this.seed;
+        for (let i = 0; i < n; i++) {
+            s = (Math.imul(s, 1664525) + 1013904223) | 0;   // integer LCG walk
+            const step = (((s >>> 16) & 0xff) - 128) * 0.05;
+            const mid = base + step;
+            inject(mid, mid - 0.5, mid + 0.5);
+        }
+        this.seed = s;
     }
 }
 
@@ -794,6 +924,17 @@ function createSymbolScope(parent, {symbol, url, log, faulty, ringSize}) {
         }
     };
 
+    // S5 burst: ONE reused scope-owned scratch frame (S2's tagged-scratch rule). inject()
+    // mutates it and calls the SAME dispatch() seam a real QUOTE tick takes, so tape / agg /
+    // bus / traceBus / quoteCount all advance identically. Zero allocation per call.
+    const burstFrame = {tag: TAG_QUOTE, bid: 0, ask: 0, mid: 0, t: 0};
+    const inject = (mid, bid, ask) => {
+        burstFrame.mid = mid;
+        burstFrame.bid = bid;
+        burstFrame.ask = ask;
+        dispatch(burstFrame);
+    };
+
     const {createSocket} = createSocketFactory(scopeReg);     // per-scope socket factory
     const makeSocket = () => feedUrl.startsWith('sim://')
         ? makeSimSocket(dispatch)
@@ -923,7 +1064,7 @@ function createSymbolScope(parent, {symbol, url, log, faulty, ringSize}) {
 
     return {
         symbol, scope: s, nodeCount,
-        book, tape, agg, tradePx, tradeSide, feedPoll,
+        book, tape, agg, tradePx, tradeSide, feedPoll, inject,
         async start() {
             await sup.start();                               // resolves 'feed' -> opens the socket
             refreshFeed();
@@ -993,6 +1134,7 @@ function createSymbolScope(parent, {symbol, url, log, faulty, ringSize}) {
 }
 
 export async function bootKernel({ctx, gl, w, h, dpr, onEvent, onMode, ringSize}) {
+    const bootAt = performance.now();                        // S5 uptime origin (re-captured on re-boot)
     const log = (kind, msg) => onEvent && onEvent(kind, msg);
     // ?faultyTeardown read ONCE, cold, at boot (never on the hot path).
     const params = typeof location !== 'undefined' ? new URLSearchParams(location.search) : null;
@@ -1021,6 +1163,8 @@ export async function bootKernel({ctx, gl, w, h, dpr, onEvent, onMode, ringSize}
         measure: false, mHead: 0, mCount: 0, mFrame: 0,
         mS1: new Float64Array(600), mS2: new Float64Array(600), mS3: new Float64Array(600),
         mSort: new Float64Array(600),
+        // S5 burst control (read by BurstSystem in the pre lane; set by handle.burst).
+        burstN: 0, burstActive: false,
     };
     try {                                                                        // lite-gl WebGL2 sinks (shared, risk 5)
         if (gl) {
@@ -1042,10 +1186,16 @@ export async function bootKernel({ctx, gl, w, h, dpr, onEvent, onMode, ringSize}
 
     // The single pre-allocated active-symbol holder. Mutated on tab switch (cold);
     // read by RenderSystem.update() every frame, never re-allocated.
-    const activeHolder = {book: null, tape: null, agg: null, feedPoll: null, tradePx: null, tradeSide: null};
+    const activeHolder = {book: null, tape: null, agg: null, feedPoll: null, tradePx: null, tradeSide: null, inject: null};
 
     const c = new Container();
     c.value('viz', viz);
+    // S5 perf counters live in the container as a VALUE (same rule that put stats in S3), so a
+    // second bootKernel gets its own counters. lastTime seeded to bootAt -> honest first frame.
+    const perf = new PerfCounters();
+    perf.bootAt = bootAt;
+    perf.lastTime = bootAt;
+    c.value('perf', perf);
     const stats = {pruned: 0, aggregations: 0, heartbeats: 0};   // finding 12: counters IN the container
     c.value('stats', stats);
     c.value('renderer:coarse', new CoarseRenderer());
@@ -1054,11 +1204,15 @@ export async function bootKernel({ctx, gl, w, h, dpr, onEvent, onMode, ringSize}
 
     const ticker = new Ticker(c);
     ticker.system('render', RenderSystem, {lane: 'normal', deps: ['viz']});      // deps: viz ONLY (hot)
+    ticker.system('perf', PerfSystem, {lane: 'post', deps: ['perf']});           // S5: measures AFTER render
+    ticker.system('burst', BurstSystem, {lane: 'pre', deps: ['viz']});           // S5: stress injector...
+    ticker.enable('burst', false);                                               // ...disabled by default
 
     const cron = new Cron(c, {tickMs: 1000});
     cron.job('aggregate', AggregateJob, interval(5000), {deps: ['stats']})
         .job('prune', PruneJob, interval(3000), {deps: ['stats']})
-        .job('heartbeat', HeartbeatJob, interval(2000), {deps: ['stats']});
+        .job('heartbeat', HeartbeatJob, interval(2000), {deps: ['stats']})
+        .job('perf', PerfJob, interval(1000), {deps: ['perf']});                 // S5: 1 Hz p99 + heap roll
 
     // shutdown bookkeeping + parent teardown narration (task 12: the walk narrates itself).
     let teardownFailed = 0, teardownTotal = 0;
@@ -1066,7 +1220,7 @@ export async function bootKernel({ctx, gl, w, h, dpr, onEvent, onMode, ringSize}
         teardownFailed++;
         log('escalate', 'teardown-error: ' + String(name) + ' -- ' + err.message);
     };
-    for (const id of ['aggregate', 'prune', 'heartbeat']) {
+    for (const id of ['aggregate', 'prune', 'heartbeat', 'perf']) {
         c.onTeardown('cron:job:' + id, () => {
             teardownTotal++;
             log('down', 'teardown: cron:' + id);
@@ -1077,8 +1231,34 @@ export async function bootKernel({ctx, gl, w, h, dpr, onEvent, onMode, ringSize}
     ticker.start();
     cron.start();
 
+    // S5 long-task observer (cold). Feature-detect EXACTLY: a PerformanceObserver whose
+    // supportedEntryTypes lists 'longtask'. Only then does longTasks leave -1; unsupported
+    // STAYS -1 (=> HUD "n/a"). null is not zero. The callback fires only when a long task
+    // exists -- cold by construction. Disconnected on shutdown (it would outlive the container).
+    let longTaskObs = null;
+    if (typeof PerformanceObserver === 'function'
+        && Array.isArray(PerformanceObserver.supportedEntryTypes)
+        && PerformanceObserver.supportedEntryTypes.includes('longtask')) {
+        perf.longTasks = 0;
+        try {
+            longTaskObs = new PerformanceObserver((list) => {
+                const entries = list.getEntries();
+                for (let i = 0; i < entries.length; i++) {
+                    perf.longTasks++;
+                    const d = entries[i].duration;
+                    if (d > perf.longWorst) perf.longWorst = d;
+                }
+            });
+            longTaskObs.observe({entryTypes: ['longtask']});
+        } catch (e) {
+            longTaskObs = null;
+            perf.longTasks = -1;
+        }
+    }
+
     const scopes = new Map();
     let activeSymbol = null, nodeCount = 0, gpuV2 = false, shuttingDown = false;
+    let burstTimer = 0;                                      // S5: the single cold burst-end timer (cleared on re-burst + shutdown)
 
     const recomputeNodes = () => {
         let total = 0;
@@ -1104,6 +1284,7 @@ export async function bootKernel({ctx, gl, w, h, dpr, onEvent, onMode, ringSize}
             activeHolder.feedPoll = null;
             activeHolder.tradePx = null;
             activeHolder.tradeSide = null;
+            activeHolder.inject = null;
             return;
         }
         activeSymbol = sym;
@@ -1113,6 +1294,7 @@ export async function bootKernel({ctx, gl, w, h, dpr, onEvent, onMode, ringSize}
         activeHolder.feedPoll = h.feedPoll;
         activeHolder.tradePx = h.tradePx;
         activeHolder.tradeSide = h.tradeSide;
+        activeHolder.inject = h.inject;                      // S5: BurstSystem reaches it via viz.active
         viz.active = activeHolder;
     };
 
@@ -1167,6 +1349,11 @@ export async function bootKernel({ctx, gl, w, h, dpr, onEvent, onMode, ringSize}
                 mid: 0, bid: 0, ask: 0, spread: 0, qps: 0, trps: 0, levels: 0,
                 syntheticLadder: true, readyz: 1, livez: 1, supState: 0, restarts: 0,
                 recorded: 0, status: 'closed', latency: -1, attempts: 0, open: false, ticks: 0,
+                // S5 perf (global, not per-scope): p99/worst/fps/long-tasks/heap/uptime/burst.
+                fps: perf.fps, p99: perf.p99, worst: perf.worst,
+                longTasks: perf.longTasks, longWorst: perf.longWorst,
+                heapMB: perf.heapMB, uptimeMs: performance.now() - bootAt,
+                ringUse: 0, burstActive: viz.burstActive,
             };
             if (!h) return base;
             const st = h.state();
@@ -1188,6 +1375,7 @@ export async function bootKernel({ctx, gl, w, h, dpr, onEvent, onMode, ringSize}
             base.attempts = st.attempts;
             base.open = st.open;
             base.ticks = st.ticks;
+            base.ringUse = (h.tape && h.tape.count) ? h.tape.count / ring : 0;   // S5: active-ring occupancy (guarded)
             return base;
         },
         setZoom(z) {
@@ -1202,6 +1390,47 @@ export async function bootKernel({ctx, gl, w, h, dpr, onEvent, onMode, ringSize}
             viz.mFrame = 0;
         },
         ringSize: ring,
+        // S5 burst stress. Enables the pre-lane BurstSystem for `ms`, pumping `n` synthetic
+        // ticks per frame into the ACTIVE scope's real pipeline; logs the p99 before/after pair.
+        burst(n = 100, ms = 10000) {
+            viz.burstN = n | 0;
+            viz.burstActive = true;
+            ticker.enable('burst', true);
+            const before = perf.p99;
+            log('stress', 'stress: burst x' + (n | 0) + ' for ' + ((ms / 1000) | 0) + 's -- synthetic ticks, bypassing the socket');
+            clearTimeout(burstTimer);                            // re-clicking within the window: no overlapping timers
+            burstTimer = setTimeout(() => {
+                if (shuttingDown) return;                        // a stale timer must not log into a reborn HUD
+                ticker.enable('burst', false);
+                viz.burstActive = false;
+                log('stress', 'stress: burst ended -- p99 ' + before.toFixed(2) + 'ms -> ' + perf.p99.toFixed(2) + 'ms');
+            }, ms);
+        },
+        // S5 graph export seam (S10 swaps only the formatter behind it). NOTE: this exports the
+        // TOP-LEVEL kernel graph ONLY -- child symbol scopes are SEPARATE containers, so this
+        // node count is parent-only, NOT readState().nodeCount (which sums parent + all scopes).
+        // Use graphNodeCount() to assert against the RIGHT number. Fail closed: any formatter
+        // throw logs 'down' and returns null (no half file).
+        exportGraph(kind) {
+            try {
+                const snap = fromContainer(c);
+                if (kind === 'json') return {name: 'market-map-graph.json', mime: 'application/json', text: toJSON(snap)};
+                if (kind === 'dot') return {name: 'market-map-graph.dot', mime: 'text/vnd.graphviz', text: toDOT(snap)};
+                if (kind === 'trace') return {name: 'market-map-graph.trace.json', mime: 'application/json', text: toChromeTrace(snap)};
+                log('down', 'graph export failed: unknown kind ' + String(kind));
+                return null;
+            } catch (e) {
+                log('down', 'graph export failed');
+                return null;
+            }
+        },
+        graphNodeCount() {
+            try {
+                return (fromContainer(c).nodes || []).length;
+            } catch {
+                return 0;
+            }
+        },
         setSource(u) {
             const h = active();
             if (h) h.setSource(u);
@@ -1233,9 +1462,17 @@ export async function bootKernel({ctx, gl, w, h, dpr, onEvent, onMode, ringSize}
         async shutdown() {
             if (shuttingDown) return;
             shuttingDown = true;
+            clearTimeout(burstTimer);                            // S5: no stale burst-end timer survives shutdown
             log('down', 'shutdown: kernel draining -- children first');
             ticker.stop();
             cron.stop();
+            if (longTaskObs) {                               // S5: the observer would outlive the container
+                try {
+                    longTaskObs.disconnect();
+                } catch (e) {
+                }
+                longTaskObs = null;
+            }
             for (const sym of Array.from(scopes.keys())) await closeSymbol(sym);   // children first
             try {
                 await c.shutdown({onTeardownError});

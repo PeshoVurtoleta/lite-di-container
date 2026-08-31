@@ -551,6 +551,19 @@
             </div>
         </div>
 
+        <div class="group">
+            <h2>Perf &amp; soak</h2>
+            <div class="rows">
+                <div class="row"><span class="k">fps</span><span class="v accent" id="fps">--</span></div>
+                <div class="row"><span class="k">frame p99 <small>0.25ms buckets</small></span><span class="v" id="p99">--</span></div>
+                <div class="row"><span class="k">worst frame</span><span class="v" id="worst">--</span></div>
+                <div class="row"><span class="k">long tasks</span><span class="v" id="longtasks">--</span></div>
+                <div class="row"><span class="k">ring</span><span class="v" id="ring">--</span></div>
+                <div class="row"><span class="k">uptime</span><span class="v" id="uptime">--</span></div>
+                <div class="row"><span class="k">heap <small>Chrome only, coarse</small></span><span class="v" id="heap">--</span></div>
+            </div>
+        </div>
+
         <div class="controls">
             <div class="slider">feed
                 <select id="source">
@@ -566,6 +579,12 @@
             <button id="replay">Replay recorded session (event-bus)</button>
             <button id="swap">Swap renderer build (rebind, GAP-3)</button>
             <button id="shutdown" class="danger" data-state="up">Shutdown kernel</button>
+            <button id="burst">Burst x100 (10s) &middot; stress the pipeline</button>
+            <div class="exports">graph export &middot; lite-di-graph
+                <button id="exp-json">JSON</button>
+                <button id="exp-dot">DOT</button>
+                <button id="exp-trace" title="the dependency graph as a trace, not a wall-clock timeline">Chrome-Trace</button>
+            </div>
         </div>
 
         <div class="group">
@@ -574,7 +593,7 @@
         </div>
 
         <div class="err" id="err" hidden></div>
-        <div class="foot">strategies selects the renderer by zoom &middot; ticker drives the loop &middot; supervisor
+        <div class="foot" id="foot">strategies selects the renderer by zoom &middot; ticker drives the loop &middot; supervisor
             heals the feed
         </div>
     </aside>
@@ -596,6 +615,7 @@
     let handle = null;
     let W = 0, H = 0;
     let curMode = '2d';
+    let lastFoot = '';                                   // S5: change-gate the whole soak line
     const wrap = cv.parentElement;
 
     // Anti-reflow seam (task 20): the canvas-wrap rect, CACHED here at size()/resize.
@@ -715,6 +735,10 @@
         log: $('log'), err: $('err'), zoom: $('zoom'), kill: $('kill'), replay: $('replay'),
         source: $('source'), swap: $('swap'), shutdown: $('shutdown'),
         tabs: $('tabs'), shutveil: $('shutveil'),
+        // S5 perf panel + soak + controls.
+        fps: $('fps'), p99: $('p99'), worst: $('worst'), longtasks: $('longtasks'),
+        ring: $('ring'), uptime: $('uptime'), heap: $('heap'), foot: $('foot'),
+        burst: $('burst'), expJson: $('exp-json'), expDot: $('exp-dot'), expTrace: $('exp-trace'),
     };
 
     // Tab strip: a fixed pool of button elements built ONCE + a trailing +add button.
@@ -915,6 +939,26 @@
     el.swap.addEventListener('click', () => {
         if (handle) handle.swapRenderer();
     });
+    el.burst.addEventListener('click', () => {
+        if (handle) handle.burst(100, 10000);
+    });
+    // S5 download helper (cold, click-only): Blob -> object URL -> anchor.click() -> revoke
+    // in the SAME handler (an un-revoked object URL retains the buffer).
+    const downloadGraph = (kind) => {
+        if (!handle) return;
+        const out = handle.exportGraph(kind);
+        if (!out) return;
+        const blob = new Blob([out.text], {type: out.mime});
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = out.name;
+        a.click();
+        URL.revokeObjectURL(url);
+    };
+    el.expJson.addEventListener('click', () => downloadGraph('json'));
+    el.expDot.addEventListener('click', () => downloadGraph('dot'));
+    el.expTrace.addEventListener('click', () => downloadGraph('trace'));
     el.shutdown.addEventListener('click', async () => {
         if (el.shutdown.dataset.state === 'down') {
             await boot();
@@ -937,7 +981,7 @@
         el.bid.textContent = fmt(s.bid);
         el.ask.textContent = fmt(s.ask);
         el.spread.textContent = fmt(s.spread);
-        el.qps.textContent = s.qps;
+        el.qps.textContent = s.burstActive ? s.qps + ' (burst)' : s.qps;
         el.trps.textContent = s.trps;
         el.ladder.textContent = s.syntheticLadder ? 'SYNTH' : 'WIRE (' + s.levels + ' lvl)';
         el.readyz.textContent = s.readyz;
@@ -955,6 +999,22 @@
         el.dReady.className = 'dot ' + (s.readyz === 0 ? 'ok' : 'warn');
         el.dLive.className = 'dot ' + (s.livez === 0 ? 'ok' : 'crit');
         el.heal.classList.toggle('on', !s.open);
+        // S5 perf rows -- writes only, no layout reads (no forced reflow). Cold at ~8Hz.
+        el.fps.textContent = s.fps;
+        el.p99.textContent = s.p99.toFixed(2) + 'ms';
+        el.worst.textContent = s.worst.toFixed(1) + 'ms';
+        el.longtasks.textContent = s.longTasks < 0 ? 'n/a' : s.longTasks;
+        el.ring.textContent = (s.ringUse * 100).toFixed(0) + '%';
+        const upS = (s.uptimeMs / 1000) | 0, upM = (upS / 60) | 0;
+        el.uptime.textContent = upM + 'm ' + (upS % 60) + 's';
+        el.heap.textContent = s.heapMB == null ? 'n/a' : s.heapMB.toFixed(1) + ' MB';
+        // Self-narrating soak line, change-gated on the WHOLE string (the audio-rooms lesson).
+        const foot = 'uptime ' + upM + 'm -- ' + (s.longTasks < 0 ? 'n/a' : s.longTasks)
+            + ' long tasks -- worst frame ' + s.worst.toFixed(0) + 'ms -- restarts ' + s.restarts;
+        if (foot !== lastFoot) {
+            lastFoot = foot;
+            el.foot.textContent = foot;
+        }
     }, 120);
 
     boot();

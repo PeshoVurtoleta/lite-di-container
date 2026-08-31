@@ -95,3 +95,37 @@ live socket is unreachable, never presented as real data. With **local** selecte
 ladder is driven from real depth arrays (HUD reads **WIRE**) even though the underlying
 numbers are synthetic; only the live Binance feed is real market data. Either way it shows
 the **architecture and package composition** at real firehose rates -- not a trading system.
+
+## Perf & exports
+
+The **Perf & soak** HUD group makes the zero-GC / self-healing claims measurable on
+screen: `fps`, frame `p99` (a histogram over the newest 600 frame deltas at 0.25 ms
+bucket resolution -- no per-frame sort, no allocation), `worst frame`, `long tasks`
+(via a `longtask` `PerformanceObserver`; reads `n/a` where the API is unsupported),
+`ring` occupancy (saturates at `100%` and stays there -- a falling number would mean the
+firehose ring is being reallocated), `uptime`, `restarts`, and an optional `heap` row
+(Chrome-only, coarse; `n/a` elsewhere). The footer narrates a live soak line. **`Burst
+x100 (10s)`** pumps 100 synthetic ticks per frame straight into the active scope's real
+pipeline (tape + `signal` aggregates + `event-bus` + trace recorder), bypassing the
+socket, so you can watch `p99` hold flat under two orders of magnitude more throughput;
+the `quotes / s` row is tagged `(burst)` so a synthetic number is never read as wire rate.
+
+Measured soak (desktop Chrome, GPU mode, 10-min Binance -- **pending the owner's DevTools
+run; cells below are placeholders, not fabricated numbers**):
+
+| metric | idle | under burst |
+| --- | --- | --- |
+| fps | _pending_ | _pending_ |
+| frame p99 | _pending_ | _pending_ |
+| worst frame | _pending_ | _pending_ |
+| long tasks (> 50 ms, after 30 s warm-up) | _pending_ | _pending_ |
+| tps (quotes+depth / s) | _pending_ | _pending_ |
+
+The **graph export** row downloads the top-level kernel dependency graph via
+`@zakkster/lite-di-graph` in three formats: `JSON` (`toJSON`), `DOT` (`toDOT`, Graphviz),
+and `Chrome-Trace` (`toChromeTrace`). Load the trace at **ui.perfetto.dev** or
+**chrome://tracing** (`market-map-graph.trace.json`). Note: the Chrome-Trace is
+`lite-di-graph`'s documented **synthetic-timeline** mapping of the DI dependency graph
+(`ts` = teardown rank, each edge a matched `s`/`f` flow pair) -- it visualizes the graph as
+a trace, **not** a wall-clock frame profile. The export covers the parent container only;
+each symbol tab is a separate child scope with its own graph.
