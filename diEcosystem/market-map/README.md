@@ -191,6 +191,41 @@ constant anchor. Its reset carries a shipped, documented ABA contract, quoted ve
 In this demo that means: unpinning while mid has returned to an `Object.is`-equal value
 keeps the stale pinned threshold -- visible, documented, not a bug.
 
+### The pooled watchlist (park vs dispose)
+
+The **Watchlist** panel is a second lifetime, distinct from tabs. A **tab** open/close is a
+scope OPEN/SHUTDOWN -- `scope.shutdown()` disposes the child scope, its VM, and its scoped
+`lite-signal` registry for good. A **watchlist** park/revive is `releaseReactive` /
+`reinitReactive` over a **retained** scope: the child scope, its registry, and its
+per-scope `defineReactive` wrapper class all survive. Three caveats worth stating outright:
+
+- **Park is REVERSIBLE, dispose is TERMINAL.** `releaseReactive(vm)` parks the VM -- its
+  reactive nodes are released back to the scoped pool but the object survives, and
+  `reinitReactive(vm, initials)` revives the **same object** (identity is stable across every
+  revive). `disposeReactive(vm)` (what `scope.shutdown()` runs) is terminal: the VM is gone
+  and any later read fails closed with `ReactiveDisposedError`. A watchlist remove NEVER
+  fires `scope.shutdown()`. This is what makes subscribe/unsubscribe churn zero-GC: 4096
+  park/revive cycles return `activeNodes` / `activeLinks` / `poolGrowths` to their exact
+  baseline (proven headless in `test/09-watchlist.test.mjs`).
+
+- **A snapshot includes deriveds; the revive filter is mandatory.** `snapshotOf(vm)` returns
+  every member INCLUDING the deriveds `mid` and `spread`. `reinitReactive` rejects any key
+  that is not a `@reactive` signal or a `@localTo` local, throwing and naming it -- feeding a
+  raw snapshot straight back throws with a message naming `mid`. Export/import therefore runs
+  the snapshot through the named `toInitials(snap, scratch)` filter, which copies only the six
+  resettable keys (`bid`, `ask`, `last`, `pinned`, `pinAnchor`, `alert`) and drops the
+  deriveds. The filter is load-bearing, not decorative (the negative case is a gate).
+
+- **`costOfInstance` is a LIVE probe, not the static ceiling.** The per-symbol `nodes` /
+  `links` row reads `costOfInstance(vm)` -- the cost of the graph that has actually formed on
+  THIS instance. It is uncached (allocates a frozen row per call), so it is sampled COLD (at
+  most 1 Hz / on park transitions), never inside the 120 ms HUD poll. It THROWS on a parked VM
+  (`ReactiveDisposedError`), so a parked row renders `parked`, gated on the entry's own live
+  flag -- never a blank swallowed from a caught throw. Contrast `costOf(Class)`, the static
+  per-class ceiling used to size the scope registry (`capacityFor`): a live probe reads at or
+  below the ceiling until every derived has been exercised. Size a registry from `costOf`,
+  never from the live probe.
+
 ## Perf & exports
 
 The **Perf & soak** HUD group makes the zero-GC / self-healing claims measurable on

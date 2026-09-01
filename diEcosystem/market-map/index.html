@@ -358,6 +358,64 @@
             color: var(--ember);
         }
 
+        /* S9 watchlist panel: a fixed pool of park/revive rows. Row elements are built ONCE
+           and mutated in place (text / class / hidden) -- never rebuilt, no innerHTML churn. */
+        .wl-list {
+            padding: 0 0.75rem 0.5rem;
+            display: grid;
+            gap: 0.3125rem;
+        }
+
+        .wl-row {
+            display: flex;
+            align-items: baseline;
+            gap: 0.5rem;
+            font-family: var(--mono);
+            font-size: .78rem;
+            font-variant-numeric: tabular-nums;
+        }
+
+        .wl-row.hidden {
+            display: none;
+        }
+
+        .wl-sym {
+            color: var(--ink);
+            min-width: 4.5rem;
+        }
+
+        .wl-state {
+            color: var(--accent);
+            font-size: .68rem;
+        }
+
+        .wl-row.parked .wl-state {
+            color: var(--muted);
+        }
+
+        .wl-cost {
+            color: var(--soft);
+            margin-left: auto;
+        }
+
+        .wl-x {
+            font-family: var(--mono);
+            font-size: .68rem;
+            color: var(--soft);
+            background: transparent;
+            border: 1px solid var(--line2);
+            border-radius: 0.375rem;
+            padding: 0.125rem 0.4375rem;
+            cursor: pointer;
+        }
+
+        @media (hover: hover) {
+            .wl-x:hover {
+                border-color: var(--accent);
+                color: var(--accent);
+            }
+        }
+
         .pills {
             display: flex;
             flex-wrap: wrap;
@@ -570,6 +628,16 @@
             </div>
         </div>
 
+        <div class="group">
+            <h2>Watchlist &middot; park / revive</h2>
+            <div class="wl-list" id="wl-list"></div>
+            <div class="rows">
+                <div class="row"><span class="k">park / revive cycles</span><span class="v" id="wl-cycles">0</span></div>
+                <div class="row"><span class="k">pool growths <small>0 = pool never grew</small></span><span class="v" id="wl-poolgrowths">0</span></div>
+                <div class="row"><span class="k">nodes delta <small>0 = conserved</small></span><span class="v" id="wl-nodes-delta">0</span></div>
+            </div>
+        </div>
+
         <div class="controls">
             <div class="slider">feed
                 <select id="source">
@@ -608,7 +676,7 @@
 </div>
 
 <script type="module">
-    import {bootKernel} from './kernel.js';
+    import {bootKernel, WATCHLIST_CAP} from './kernel.js';
 
     const SUP = ['INIT', 'RUNNING', 'ESCALATED', 'SHUT_DOWN'];
     const TAB_POOL = 8;                                  // fixed tab element pool; reused, never rebuilt wholesale
@@ -748,6 +816,9 @@
         fps: $('fps'), p99: $('p99'), worst: $('worst'), longtasks: $('longtasks'),
         ring: $('ring'), uptime: $('uptime'), heap: $('heap'), foot: $('foot'),
         burst: $('burst'), expJson: $('exp-json'), expDot: $('exp-dot'), expTrace: $('exp-trace'),
+        // S9 watchlist panel.
+        wlList: $('wl-list'), wlCycles: $('wl-cycles'), wlPoolgrowths: $('wl-poolgrowths'),
+        wlNodesDelta: $('wl-nodes-delta'),
     };
 
     // Tab strip: a fixed pool of button elements built ONCE + a trailing +add button.
@@ -782,6 +853,85 @@
     el.tabs.appendChild(addInput);
     el.addInput = addInput;
 
+    // S9 watchlist panel: a fixed pool of park/revive rows, built ONCE. Each row caches its
+    // own child spans + toggle button; renderWatchlist() mutates them in place (text / class /
+    // hidden), never rebuilding the list or touching innerHTML. The toggle button carries its
+    // symbol in dataset.sym; ONE delegated listener drives park/revive. `wlRows` is a single
+    // preallocated array of plain records, reused by every handle.readWatchlist() call so the
+    // COLD 1 Hz sample allocates nothing of ours (costOfInstance's own frozen row is the
+    // decorator's, unavoidable, and why the sample is cold).
+    const WL_POOL = WATCHLIST_CAP;                    // single source: the kernel's park/revive cap sizes the row pool
+    const wlPool = [];
+    const wlRows = [];
+    for (let i = 0; i < WL_POOL; i++) {
+        const row = document.createElement('div');
+        row.className = 'wl-row hidden';
+        const sym = document.createElement('span');
+        sym.className = 'wl-sym';
+        const state = document.createElement('span');
+        state.className = 'wl-state';
+        const cost = document.createElement('span');
+        cost.className = 'wl-cost';
+        const x = document.createElement('button');
+        x.className = 'wl-x';
+        x.type = 'button';
+        row.append(sym, state, cost, x);
+        el.wlList.appendChild(row);
+        wlPool.push({row, sym, state, cost, x});
+        wlRows.push({symbol: '', live: false, nodes: 0, links: 0});   // preallocated out-record
+    }
+
+    // COLD (1 Hz / on add-park-close transitions), NEVER the 120 ms poll: readWatchlist calls
+    // the uncached costOfInstance. Writes only -- no offsetWidth / getBoundingClientRect /
+    // getComputedStyle, so no forced reflow. A parked row (nodes === -1) renders "parked",
+    // gated on its own live flag, never a blank swallowed from a caught throw.
+    function renderWatchlist() {
+        if (!handle) {
+            for (let i = 0; i < WL_POOL; i++) wlPool[i].row.classList.add('hidden');
+            return;
+        }
+        const n = handle.readWatchlist(wlRows);
+        for (let i = 0; i < WL_POOL; i++) {
+            const cell = wlPool[i];
+            if (i < n) {
+                const r = wlRows[i];
+                cell.sym.textContent = r.symbol;
+                if (r.live) {
+                    cell.row.classList.remove('parked');
+                    cell.state.textContent = 'live';
+                    cell.cost.textContent = r.nodes + ' n / ' + r.links + ' l';
+                    cell.x.textContent = 'park';
+                } else {
+                    cell.row.classList.add('parked');
+                    cell.state.textContent = 'parked';
+                    cell.cost.textContent = 'parked';
+                    cell.x.textContent = 'revive';
+                }
+                cell.x.dataset.sym = r.symbol;
+                cell.x.dataset.live = r.live ? '1' : '0';
+                cell.row.classList.remove('hidden');
+            } else {
+                cell.x.dataset.sym = '';
+                cell.row.classList.add('hidden');
+            }
+        }
+        const st = handle.watchlistStats();
+        el.wlCycles.textContent = st.cycles;
+        el.wlPoolgrowths.textContent = st.poolGrowths;
+        el.wlNodesDelta.textContent = st.nodesDelta;
+    }
+
+    // ONE delegated listener for the whole list: park a live VM / revive a parked one. Neither
+    // fires scope.shutdown() -- the scope, its registry, and its wrapper class are retained.
+    el.wlList.addEventListener('click', (e) => {
+        if (!handle) return;
+        const btn = e.target.closest('.wl-x');
+        if (!btn || !btn.dataset.sym) return;
+        if (btn.dataset.live === '1') handle.parkSymbol(btn.dataset.sym);
+        else handle.reviveSymbol(btn.dataset.sym);
+        renderWatchlist();
+    });
+
     function showAddInput() {
         el.addInput.value = '';
         el.addInput.classList.remove('hidden');
@@ -802,6 +952,7 @@
         }
         await handle.addSymbol(sym, streamUrl(sym));    // kernel dedupes: already-open -> setActive
         renderTabs();
+        renderWatchlist();                              // add is a watchlist transition (cold)
     }
 
     el.addInput.addEventListener('keydown', async (e) => {
@@ -842,6 +993,7 @@
             if (sym) {
                 await handle.closeSymbol(sym);
                 renderTabs();
+                renderWatchlist();                      // close forgets the watchlist entry (cold)
             }
             return;
         }
@@ -882,6 +1034,7 @@
         setShutState(false);
         pushLog('heal', 'boot: kernel re-registered -- ' + handle.readState().nodeCount + ' graph nodes wired');
         renderTabs();
+        renderWatchlist();
     }
 
     // Listeners attached ONCE; each reads the live `handle` with a null guard.
@@ -986,11 +1139,16 @@
         }
         setShutState(true);
         renderTabs();
+        renderWatchlist();                              // handle is null now -> rows hide
     });
 
     // HUD refresh (decoupled from the render loop; cached refs, null-guarded handle).
+    let hudTick = 0;                                     // S9: 1 Hz gate for the COLD watchlist sample
     setInterval(() => {
         if (!handle) return;
+        // The watchlist row reads costOfInstance (uncached) -- sample it COLD, ~1 Hz (every
+        // 8th 120 ms poll), NEVER on every poll. Transitions render it eagerly elsewhere.
+        if ((hudTick++ & 7) === 0) renderWatchlist();
         const s = handle.readState();
         el.mid.textContent = fmt(s.mid);
         el.bid.textContent = fmt(s.bid);

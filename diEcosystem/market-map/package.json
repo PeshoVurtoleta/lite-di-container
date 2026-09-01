@@ -7,7 +7,7 @@
     "test": "node --test test/*.test.mjs",
     "torture": "node --expose-gc test/torture.mjs",
     "alloc": "node --expose-gc test/alloc-parse.mjs && node --expose-gc test/alloc-applydepth.mjs",
-    "churn": "node --expose-gc --test test/scope-churn.test.mjs",
+    "churn": "node --expose-gc --test test/scope-churn.test.mjs test/09-watchlist.test.mjs test/09b-watchlist-boundary.test.mjs",
     "verify": "npm test && npm run torture && npm run alloc && npm run churn"
   },
   "dependencies": {

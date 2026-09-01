@@ -21,10 +21,12 @@ import {Health, LANES} from '@zakkster/lite-di-health';
 import {fromContainer, toJSON, toDOT, toChromeTrace} from '@zakkster/lite-di-graph';
 import {createSignalScope, reactiveService, SIGNAL_REGISTRY_TOKEN} from '@zakkster/lite-di-signal';
 import {createRegistry} from '@zakkster/lite-signal';
-import {defineReactive, disposeReactive, costOf, capacityFor} from '@zakkster/lite-signal-decorators';
+import {defineReactive, disposeReactive, costOf, capacityFor,
+    releaseReactive, reinitReactive, costOfInstance, snapshotOf} from '@zakkster/lite-signal-decorators';
 import {createSocketFactory} from '@zakkster/lite-ws';
 import {RingBuffer} from '@zakkster/lite-ring-buffer';
 import {TAG_QUOTE, TAG_DEPTH, TAG_TRADE, MAXLVL, parseFrame, OrderBook} from './Frames.js';
+import {createWatchlist} from './watchlist.js';
 
 // lite-gl/backend is loaded COLD (not a static import) so bootKernel can run headless
 // under node:test, where WebGL is absent. The dynamic import is awaited once, only when
@@ -84,6 +86,10 @@ function pickRing() {
     if (mem >= 4 && cores >= 8 && ring < RING_MAX) ring *= 2;   // many cores nudge one tier
     return clampRing(ring);
 }
+// S9 watchlist capacity -- the SINGLE source of truth for both the kernel's park/revive pool
+// and index.html's row pool (imported there as WL_POOL). Two independent 8s would silently
+// truncate (watchlist.add throws past cap) or hide rows; there is exactly one.
+export const WATCHLIST_CAP = 8;
 const POLL_MS = 100;               // per-scope background-ingest poll cadence (G1)
 const TAU = Math.PI * 2;
 const DOT_BUY = '#4EE7D2';         // taker-buy trade dot (teal)
@@ -251,11 +257,16 @@ class TapeApply {
 }
 
 class AggApply {
-    constructor(vm) {
+    constructor(vm, feedGate) {
         this.vm = vm;
+        this.feedGate = feedGate;                      // S9: the park gate (public-mutable {live} field)
     }
 
-    handle(f) {                                        // [HOT] three plain accessor stores, no alloc
+    handle(f) {                                        // [HOT] one flag read + three plain accessor stores, no alloc
+        // A PARKED VM (watchlist remove -> releaseReactive) rejects reactive writes with a
+        // throw. The feed keeps running while parked (the scope/socket survive for instant
+        // revive), so the gate MUST short-circuit BEFORE any vm write. One field read, no alloc.
+        if (!this.feedGate.live) return;
         this.vm.bid = f.bid;
         this.vm.ask = f.ask;
         this.vm.last = f.mid;
@@ -493,7 +504,9 @@ class PerfJob {
 // injects burstN synthetic ticks per frame straight into the ACTIVE scope's dispatch seam
 // (tape + vm + bus + traceBus + counters) via an integer-LCG walk on the last real mid.
 // Zero allocation per synthetic tick: scope.inject mutates one reused scope-owned frame.
-class BurstSystem {
+// Exported so the S9 gate can execute update() headlessly against the REAL parked active
+// holder (the ticker does not expose its resolved system instances).
+export class BurstSystem {
     constructor(viz) {
         this.viz = viz;
         this.seed = 0x9e3779b1 | 0;                // LCG state (integer)
@@ -505,6 +518,8 @@ class BurstSystem {
         if (!a) return;
         const inject = a.inject;
         if (!inject) return;
+        const g = a.feedGate;                      // S9: the active symbol is parkable (releaseReactive keeps it active);
+        if (g && !g.live) return;                  // a PARKED vm throws on a.vm.mid -- gate off, same idiom as AggApply
         const n = v.burstN;
         const base = a.vm.mid;                     // last real mid (derived), read ONCE outside the loop
         let s = this.seed;
@@ -943,11 +958,19 @@ function createSymbolScope(parent, {symbol, url, log, faulty, ringSize, socketFa
     const replayCtl = {on: false};                           // per-scope replay gate
     s.value('replayCtl', replayCtl);
 
+    // S9 park gate (di-ticker public-mutable-field idiom). live=true while the VM is reactive;
+    // the watchlist flips it false on park (after releaseReactive) and true on revive (after
+    // reinitReactive). AggApply and state() read it O(1), zero-alloc, on the hot path so a
+    // parked VM is never written or read (both throw ReactiveDisposedError). The scope, its
+    // socket, and its registry all survive a park -- only the reactive writes are gated off.
+    const feedGate = {live: true};
+    s.value('feedGate', feedGate);
+
     // Object bus (unrecorded) + numeric trace recorder. Registered as singletons so
     // their onTeardown -> dispose() actually fires (risk 4): a VALUE would leak the
     // recorder ring across the 50x churn gate (G2).
     const bus = new EventBus(s);
-    bus.on('tick', TapeApply, ['tape']).on('tick', AggApply, ['vm'])
+    bus.on('tick', TapeApply, ['tape']).on('tick', AggApply, ['vm', 'feedGate'])
         .on('trade', TradeApply, ['trades:px', 'trades:side']);
     s.singletonFactory('bus', () => bus);
     s.onTeardown('bus', (b) => {
@@ -1000,7 +1023,7 @@ function createSymbolScope(parent, {symbol, url, log, faulty, ringSize, socketFa
         // local back to mid (upstream-keyed). Log that reset ONCE. If the quote's mid
         // returned to the last-adopted value (the ABA case), alert stays stale and this
         // stays pending -- honest, per the localTo contract. Gated: false in steady state.
-        if (alertResetPending && vm && vm.alert === vm.mid) {
+        if (alertResetPending && feedGate.live && vm && vm.alert === vm.mid) {   // feedGate: parked vm getters throw
             alertResetPending = false;
             log('heal', 'localTo: upstream moved -> alert threshold reset to mid (upstream-keyed)');
         }
@@ -1161,7 +1184,7 @@ function createSymbolScope(parent, {symbol, url, log, faulty, ringSize, socketFa
     }
 
     return {
-        symbol, scope: s, nodeCount,
+        symbol, scope: s, registry: scopeReg, feedGate, nodeCount,   // registry + feedGate: S9 watchlist park/revive seams
         book, tape, vm, tradePx, tradeSide, feedPoll, inject,
         sup,                                             // test seam (S6): heal.test.mjs reaches the per-scope supervisor to reportFault
         async start() {
@@ -1182,9 +1205,14 @@ function createSymbolScope(parent, {symbol, url, log, faulty, ringSize, socketFa
                 } catch {
                 }
             }
+            // A PARKED VM (watchlist remove) throws on every getter. If this symbol is parked
+            // while still the active tab, read ZERO for the reactive fields -- gate on the flag,
+            // never try/catch a throw into a value. The socket/health fields below are unaffected.
+            const gLive = feedGate.live;
             return {
-                mid: vm.mid, bid: vm.bid, ask: vm.ask, spread: vm.spread, qps: tpsSig(), trps,
-                alert: vm.alert, pinned: vm.pinned,
+                mid: gLive ? vm.mid : 0, bid: gLive ? vm.bid : 0, ask: gLive ? vm.ask : 0,
+                spread: gLive ? vm.spread : 0, qps: tpsSig(), trps,
+                alert: gLive ? vm.alert : 0, pinned: gLive ? vm.pinned : false,
                 levels: book ? book.n : 0, syntheticLadder: book ? book.synthetic : true,
                 readyz: health.readyz(), livez: health.livez(), supState: sup.state, restarts,
                 recorded: traceBus.recorded(), status, latency, attempts, open,
@@ -1259,6 +1287,16 @@ function createSymbolScope(parent, {symbol, url, log, faulty, ringSize, socketFa
 export async function bootKernel({ctx, gl, w, h, dpr, onEvent, onMode, ringSize, socketFactory = createSocketFactory, glSinks = defaultGlSinks}) {
     const bootAt = performance.now();                        // S5 uptime origin (re-captured on re-boot)
     const log = (kind, msg) => onEvent && onEvent(kind, msg);
+
+    // S9 T2 -- capability assert (cold, boot): the pooled watchlist needs four
+    // lite-signal-decorators functions an OLD esm.sh build (pre-1.5.0) would lack. Fail
+    // closed HERE, before wiring the watchlist, with a NAMED error -- index.html's boot
+    // catch surfaces e.stack in the #err block. null is not a function.
+    if (typeof releaseReactive !== 'function' || typeof reinitReactive !== 'function'
+        || typeof costOfInstance !== 'function' || typeof snapshotOf !== 'function') {
+        throw new TypeError('bootKernel: @zakkster/lite-signal-decorators is missing the park/revive '
+            + 'surface (releaseReactive/reinitReactive/costOfInstance/snapshotOf) -- pin >= 1.5.0 in the import map');
+    }
     // ?faultyTeardown read ONCE, cold, at boot (never on the hot path).
     const params = typeof location !== 'undefined' ? new URLSearchParams(location.search) : null;
     const faulty = !!(params && params.has('faultyTeardown'));
@@ -1314,7 +1352,7 @@ export async function bootKernel({ctx, gl, w, h, dpr, onEvent, onMode, ringSize,
 
     // The single pre-allocated active-symbol holder. Mutated on tab switch (cold);
     // read by RenderSystem.update() every frame, never re-allocated.
-    const activeHolder = {book: null, tape: null, vm: null, feedPoll: null, tradePx: null, tradeSide: null, inject: null};
+    const activeHolder = {book: null, tape: null, vm: null, feedPoll: null, tradePx: null, tradeSide: null, inject: null, feedGate: null};
 
     const c = new Container();
     c.value('viz', viz);
@@ -1413,6 +1451,7 @@ export async function bootKernel({ctx, gl, w, h, dpr, onEvent, onMode, ringSize,
             activeHolder.tradePx = null;
             activeHolder.tradeSide = null;
             activeHolder.inject = null;
+            activeHolder.feedGate = null;
             return;
         }
         activeSymbol = sym;
@@ -1423,8 +1462,31 @@ export async function bootKernel({ctx, gl, w, h, dpr, onEvent, onMode, ringSize,
         activeHolder.tradePx = h.tradePx;
         activeHolder.tradeSide = h.tradeSide;
         activeHolder.inject = h.inject;                      // S5: BurstSystem reaches it via viz.active
+        activeHolder.feedGate = h.feedGate;                  // S9: BurstSystem gates on it (parked active symbol)
         viz.active = activeHolder;
     };
+
+    // S9 T4 -- the pooled watchlist (park/revive over RETAINED scopes). Every OPEN symbol
+    // gets a LIVE watchlist entry; parkSymbol()/reviveSymbol() flip its VM between parked and
+    // live WITHOUT firing scope.shutdown(). `lastTicks` holds ONE preallocated record per
+    // symbol -- the watchlist captures the last live values into it at park (no per-tick
+    // alloc) and re-seeds the revive from it. handle._watchlist (the entries Map) is S10's
+    // symbol -> {vm, scope, registry, live} label seam.
+    const lastTicks = new Map();
+    const lastTickOf = (sym) => {
+        let rec = lastTicks.get(sym);
+        if (!rec) {
+            rec = {bid: 0, ask: 0, last: 0, pinned: false, pinAnchor: 0, alert: 0};   // preallocated per symbol
+            lastTicks.set(sym, rec);
+        }
+        return rec;
+    };
+    const watchlist = createWatchlist({
+        scopes,
+        SymbolVMOf: (sym) => { const h = scopes.get(sym); return h ? h.vm : null; },
+        lastTickOf,
+        capacity: WATCHLIST_CAP,
+    });
 
     const addSymbol = async (sym, u) => {
         if (scopes.has(sym)) {
@@ -1434,6 +1496,13 @@ export async function bootKernel({ctx, gl, w, h, dpr, onEvent, onMode, ringSize,
         const h = createSymbolScope(c, {symbol: sym, url: u, log, faulty, ringSize: ring, socketFactory});
         await h.start();
         scopes.set(sym, h);
+        // Register a LIVE watchlist entry over the freshly cold-constructed scope. Fail closed
+        // on capacity (fail LOUD in the log) without breaking the scope that already opened.
+        try {
+            watchlist.add(sym);
+        } catch (e) {
+            log('down', 'watchlist: ' + (e && e.message ? e.message : String(e)));
+        }
         recomputeNodes();
         log('heal', 'scope: ' + sym + ' opened -- child scope + own signal registry (' + h.nodeCount + ' bindings)');
         if (activeSymbol === null) setActive(sym);
@@ -1445,6 +1514,8 @@ export async function bootKernel({ctx, gl, w, h, dpr, onEvent, onMode, ringSize,
         if (!h) return;
         await h.close(onTeardownError);                      // child before parent (Container.js child-guard)
         scopes.delete(sym);
+        watchlist.forget(sym);                               // drop the entry so a torn-down VM/registry is not retained (leak gate)
+        lastTicks.delete(sym);
         recomputeNodes();
         if (activeSymbol === sym) setActive(scopes.size > 0 ? scopes.keys().next().value : null);
     };
@@ -1473,6 +1544,17 @@ export async function bootKernel({ctx, gl, w, h, dpr, onEvent, onMode, ringSize,
         // supervisor) through it. _c: the parent container, RESERVED for the S8/S9 gates
         // (plans/PLAN-S6.md:45); no S6 test consumes it yet.
         _c: c, _scopes: scopes,
+        // S9 seams. _watchlist: the symbol -> {vm, scope, registry, live} entries Map (S10
+        // label source). watchlist: the full park/revive API, for the T8 gate.
+        _watchlist: watchlist.entries, watchlist, watchlistCap: WATCHLIST_CAP,
+        // Park (releaseReactive) / revive (reinitReactive) the symbol's VM. The scope, its
+        // registry, and its wrapper class survive -- scope.shutdown() is never fired here.
+        parkSymbol(sym) { return watchlist.remove(sym); },
+        reviveSymbol(sym) { return watchlist.add(sym); },
+        exportWatchlist() { return watchlist.exportWatchlist(); },
+        importWatchlist(json) { return watchlist.importWatchlist(json); },
+        readWatchlist(rows) { return watchlist.readWatchlist(rows); },
+        watchlistStats() { return watchlist.stats(); },
         readState() {
             const h = active();
             const base = {
