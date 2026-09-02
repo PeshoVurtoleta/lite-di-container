@@ -17,8 +17,10 @@ import {GcProfiler, checkNoGc} from '@zakkster/lite-gc-profiler';
 import {parseFrame, OrderBook} from '../Frames.js';
 import {depth20} from './fixtures/Frames.fixtures.mjs';
 
-const CYCLES = 8192;
-const HOT = 1000000;
+// The default 8192 is the CI churn gate; TORTURE_CYCLES overrides it for a longer
+// soak run (numbers only -- the pass/fail bar is unchanged: leak must be 0 either way).
+const CYCLES = Number(process.env.TORTURE_CYCLES) || 8192;
+const HOT = Number(process.env.TORTURE_HOT) || 1000000;
 const LEAK = process.env.TORTURE_LEAK === '1';   // canary: deliberate retention
 const leaked = [];                               // holds books ONLY when LEAK is set
 

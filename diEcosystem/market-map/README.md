@@ -271,6 +271,25 @@ run; cells below are placeholders, not fabricated numbers**):
 | long tasks (> 50 ms, after 30 s warm-up) | _pending_ | _pending_ |
 | tps (quotes+depth / s) | _pending_ | _pending_ |
 
+The browser-render metrics above need a real DevTools run (owner-manual). The
+**kernel's** zero-GC claim, though, is measured headless and is not a placeholder --
+`node --expose-gc test/torture.mjs` under a sustained soak
+(`TORTURE_CYCLES=131072 TORTURE_HOT=5000000`, node 22, macOS):
+
+| soak metric | measured |
+| --- | --- |
+| scope open/close cycles | 131,072 |
+| hot-frame applies | 5,000,000 |
+| leaked scopes after gc + settle | **0** |
+| major GC | **0** |
+| minor GC | 183 |
+| worst single op | 0.15 ms |
+| parse allocation | 0.008 B/op (8032 B net) |
+
+The default CI gate runs the same harness at `CYCLES = 8192` and fails closed if a
+single scope survives teardown; an armed `TORTURE_LEAK=1` canary that exits 0 turns CI
+red (the break-gate). The numbers above are the soak-scaled run of that same gate.
+
 The **graph export** row downloads the top-level kernel dependency graph via
 `@zakkster/lite-di-graph` in three formats: `JSON` (`toJSON`), `DOT` (`toDOT`, Graphviz),
 and `Chrome-Trace` (`toChromeTrace`). Load the trace at **ui.perfetto.dev** or

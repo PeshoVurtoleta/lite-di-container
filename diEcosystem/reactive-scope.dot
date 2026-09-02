@@ -1,0 +1,29 @@
+// One live market-map symbol scope's reactive dependency graph, emitted by
+// lite-devtools toDot({ labelResolver }) with the decorators' labelOf bound to
+// the scope's registry. This is the exact shape the demo's DOT export produces
+// for one scope (steady state, 7 reachable reactive nodes). Rendered inline as
+// SVG in index.html's "The reactive plane" section; regenerate a Graphviz
+// version with:  dot -Tsvg reactive-scope.dot -o reactive-scope.svg
+digraph scope_BTCUSDT {
+  rankdir=LR;
+  node [fontname="monospace"];
+  n8 [label="effect#8\nSymbolVMBase@anchor", shape=diamond];
+  n11 [label="effect#11\nSymbolVMBase#onQuote", shape=diamond];
+  n10 [label="computed#10\nSymbolVMBase.spread", shape=box];
+  n9 [label="computed#9\nSymbolVMBase.mid", shape=box];
+  n5 [label="signal#5\nSymbolVMBase.pinned", shape=ellipse];
+  n2 [label="signal#2\nSymbolVMBase.bid", shape=ellipse];
+  n3 [label="signal#3\nSymbolVMBase.ask", shape=ellipse];
+  n8 -> n11 [style=dashed, color=gray, arrowhead=odot];
+  n8 -> n10 [style=dashed, color=gray, arrowhead=odot];
+  n8 -> n9 [style=dashed, color=gray, arrowhead=odot];
+  n9 -> n11;
+  n10 -> n11;
+  n5 -> n11;
+  n2 -> n11;
+  n3 -> n11;
+  n3 -> n10;
+  n2 -> n10;
+  n2 -> n9;
+  n3 -> n9;
+}
