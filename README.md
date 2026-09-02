@@ -431,7 +431,7 @@ only the bricks a given service needs.
 
 <p align="center"><sub>The kernel at a glance. An interactive version lives in <a href="diEcosystem/index.html"><code>diEcosystem/index.html</code></a>.</sub></p>
 
-<p align="center"><sub><b>Seen in production shape:</b> <a href="https://zakkster.github.io/LiteDiContainer/diEcosystem/market-map/">the live <code>market-map</code> demo</a> -- a self-healing, zero-GC market-data kernel running this whole ring in the browser, where each symbol scope even draws its own reactive view-model as labeled Graphviz DOT -- source under <a href="diEcosystem/market-map/"><code>diEcosystem/market-map/</code></a>.</sub></p>
+<p align="center"><sub><b>Seen in production shape:</b> <a href="https://peshovurtoleta.github.io/lite-di-container/diEcosystem/market-map/">the live <code>market-map</code> demo</a> -- a self-healing, zero-GC market-data kernel running this whole ring in the browser, where each symbol scope even draws its own reactive view-model as labeled Graphviz DOT -- source under <a href="diEcosystem/market-map/"><code>diEcosystem/market-map/</code></a>.</sub></p>
 
 <p align="center">
   <a href="https://github.com/PeshoVurtoleta/lite-di-container/actions/workflows/ci.yml"><img src="https://github.com/PeshoVurtoleta/lite-di-container/actions/workflows/ci.yml/badge.svg" alt="CI: the market-map demo boots the real kernel headless under node:test, with leak + alloc + break-gate jobs gating the Pages deploy."></a>

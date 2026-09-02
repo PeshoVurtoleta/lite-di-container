@@ -2,7 +2,7 @@
 
 > A self-healing, zero-GC market-data kernel that runs in the browser -- 15 zero-dependency single-file ESM packages, no bundler.
 
-**Live (nothing to install):** https://zakkster.github.io/LiteDiContainer/diEcosystem/market-map/
+**Live (nothing to install):** https://peshovurtoleta.github.io/lite-di-container/diEcosystem/market-map/
 
 <!-- Hero GIF (owner-manual capture, T1): a ~5s loop of the Kill-feed heal -- click
      "Kill feed", the event log shows fault -> restart -> fresh socket, the restarts
@@ -70,7 +70,7 @@ graph LR
 
 ## Run it
 
-**Live (nothing to install):** https://zakkster.github.io/LiteDiContainer/diEcosystem/market-map/
+**Live (nothing to install):** https://peshovurtoleta.github.io/lite-di-container/diEcosystem/market-map/
 
 It opens cold and paints a moving price trace + order-book ladder within ~3s. The default
 feed is a **live Binance BTCUSDT** stream; if that socket is unreachable, a supervised
