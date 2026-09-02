@@ -61,8 +61,42 @@ jobs:
             echo "break control did not break"; exit 1
           fi
 
+  audio-rooms-test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node: [20, 22, 24]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - run: npm ci
+        working-directory: diEcosystem/audio-rooms
+      - run: npm test
+        working-directory: diEcosystem/audio-rooms
+
+  audio-rooms-break-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci
+        working-directory: diEcosystem/audio-rooms
+      # The canary MUST break: AR_BREAK=1 arms a no-op engine destroy, so the census
+      # never returns to 0 -- G1 reds and `npm test` exits non-zero. A green run here
+      # means the census gate stopped biting; fail CI so a dead gate never ships green.
+      - name: armed census canary must exit non-zero
+        working-directory: diEcosystem/audio-rooms
+        run: |
+          if AR_BREAK=1 npm test; then
+            echo "break control did not break"; exit 1
+          fi
+
   deploy:
-    needs: [test, leak, break-gate]
+    needs: [test, leak, break-gate, audio-rooms-test, audio-rooms-break-gate]
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     # Only the Pages deploy serializes; the test gates must never cancel each other.

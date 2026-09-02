@@ -4,27 +4,29 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>audio-rooms -- lite-di-* spatial-audio kernel (skeleton)</title>
-    <!-- Import map resolves every package to a LOCAL relative path from the suite root,
-         so the demo runs OFFLINE (no CDN). Served from the suite root; the page lives at
-         /LiteDiContainer/diEcosystem/audio-rooms/, so ../../../ reaches the suite root. -->
+    <!-- Version-pinned esm.sh URLs: CDN-absolute and host-independent, so the demo loads
+         identically in local static hosting and on the single-repo Pages deploy (no suite
+         checkout needed). The ?deps=@zakkster/lite-signal@1.5.0 pin on lite-audio +
+         lite-audio-pool forces ONE shared lite-signal instance (avoids the dual-instance
+         reactivity trap). Pins mirror package.json / README key-for-key. -->
     <script type="importmap">
 {
   "imports": {
-    "@zakkster/lite-di-container":  "../../../LiteDiContainer/Container.js",
-    "@zakkster/lite-di-event-bus":  "../../../LiteDiEventBus/EventBus.js",
-    "@zakkster/lite-di-signal":     "../../../LiteDiSignal/DiSignal.js",
-    "@zakkster/lite-di-ticker":     "../../../LiteDiTicker/Ticker.js",
-    "@zakkster/lite-di-strategies": "../../../LiteDiStrategies/Strategies.js",
-    "@zakkster/lite-di-supervisor": "../../../LiteDiSupervisor/Supervisor.js",
-    "@zakkster/lite-di-health":     "../../../LiteDiHealth/Health.js",
-    "@zakkster/lite-di-graph":      "../../../LiteDiGraph/DIGraph.js",
-    "@zakkster/lite-di-cron":       "../../../LiteDiCron/Cron.js",
-    "@zakkster/lite-audio":         "../../../LiteAudio/Audio.js",
-    "@zakkster/lite-audio-pool":    "../../../LiteAudioPool/AudioPool.js",
-    "@zakkster/lite-signal":        "../../../LiteSignal/Signal.js",
-    "@zakkster/lite-raf":           "../../../LiteRaf/RAF.js",
-    "@zakkster/lite-gl":            "../../../LiteGL/GL.js",
-    "@zakkster/lite-gl/backend":    "../../../LiteGL/GLBackend.js"
+    "@zakkster/lite-di-container":  "https://esm.sh/@zakkster/lite-di-container@2.2.0",
+    "@zakkster/lite-di-event-bus":  "https://esm.sh/@zakkster/lite-di-event-bus@1.1.0",
+    "@zakkster/lite-di-signal":     "https://esm.sh/@zakkster/lite-di-signal@1.0.0",
+    "@zakkster/lite-di-ticker":     "https://esm.sh/@zakkster/lite-di-ticker@1.0.0",
+    "@zakkster/lite-di-strategies": "https://esm.sh/@zakkster/lite-di-strategies@1.0.0",
+    "@zakkster/lite-di-supervisor": "https://esm.sh/@zakkster/lite-di-supervisor@1.0.0",
+    "@zakkster/lite-di-health":     "https://esm.sh/@zakkster/lite-di-health@1.0.0",
+    "@zakkster/lite-di-graph":      "https://esm.sh/@zakkster/lite-di-graph@1.0.0",
+    "@zakkster/lite-di-cron":       "https://esm.sh/@zakkster/lite-di-cron@1.0.0",
+    "@zakkster/lite-audio":         "https://esm.sh/@zakkster/lite-audio@2.5.1?deps=@zakkster/lite-signal@1.5.0",
+    "@zakkster/lite-audio-pool":    "https://esm.sh/@zakkster/lite-audio-pool@1.4.0?deps=@zakkster/lite-signal@1.5.0",
+    "@zakkster/lite-signal":        "https://esm.sh/@zakkster/lite-signal@1.5.0",
+    "@zakkster/lite-raf":           "https://esm.sh/@zakkster/lite-raf@1.2.0",
+    "@zakkster/lite-gl":            "https://esm.sh/@zakkster/lite-gl@2.0.0",
+    "@zakkster/lite-gl/backend":    "https://esm.sh/@zakkster/lite-gl@2.0.0/backend"
   }
 }
     </script>

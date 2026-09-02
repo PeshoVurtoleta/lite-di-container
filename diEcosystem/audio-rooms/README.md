@@ -15,19 +15,23 @@ dropping the viewport.
 
 ## Run it -- ONE process
 
-There is no feed server. Just serve the suite root and open the page (the import map
-resolves every package to a **local** relative path, so it runs offline -- no CDN):
+**Live:** https://peshovurtoleta.github.io/lite-di-container/diEcosystem/audio-rooms/
+
+There is no feed server and no build step. The import map resolves every package to a
+**version-pinned esm.sh URL** (CDN-absolute and host-independent, so the page loads
+identically on Pages or from a local static host -- it needs a network, not a suite
+checkout). To run it locally, serve this directory and open the page:
 
 ```bash
-cd /Users/zakkster/Work/Portfolio/LiteLibrariesSuite
+cd /Users/zakkster/Work/Portfolio/LiteLibrariesSuite/LiteDiContainer/diEcosystem/audio-rooms
 python3 -m http.server 8099 --bind 127.0.0.1
 ```
 
-Then open: `http://127.0.0.1:8099/LiteDiContainer/diEcosystem/audio-rooms/index.html`
+Then open: `http://127.0.0.1:8099/index.html`
 
 Click **to start** (that first gesture unlocks the shared `AudioContext` -- lite-audio
-auto-unlocks on `mousedown`/`keydown`). No build step, no bundler. Every package is
-zero-dep single-file ESM, resolved in-browser by the import map.
+auto-unlocks on `mousedown`/`keydown`). No bundler. Every package is zero-dep single-file
+ESM, resolved in-browser by the import map.
 
 ## What each package does here
 
@@ -44,9 +48,9 @@ zero-dep single-file ESM, resolved in-browser by the import map.
 | `lite-di-cron` | 1.0.0 | wall-clock housekeeping tick per room |
 | `lite-audio` | 2.5.1 | the real Web Audio engine: ONE per room scope, all sharing ONE `AudioContext`; `createBus('world',{spatial:'positional'})`, `defineSounds` (procedural WAV `data:` URIs), `play` -> positioned voices, `setPosition` (zero-alloc caller stamp; the engine's own ~10Hz monitor does the throttled param write), `destroy()` (disconnects every node, does NOT close the ctx) |
 | `lite-audio-pool` | 1.4.0 | lite-audio's per-bus voice pool (the PannerNode-per-voice spatial nodes) |
-| `lite-signal` | 1.4.4 | lite-di-signal's + lite-audio's reactive core |
-| `lite-raf` | 1.1.0 | lite-di-ticker's frame source |
-| `lite-gl` | 1.5.0 | instanced WebGL2 point sink for the emitter cloud past 2.2x |
+| `lite-signal` | 1.5.0 | lite-di-signal's + lite-audio's reactive core |
+| `lite-raf` | 1.2.0 | lite-di-ticker's frame source |
+| `lite-gl` | 2.0.0 | instanced WebGL2 point sink for the emitter cloud past 2.2x |
 
 ## The two headline beats
 
@@ -60,6 +64,29 @@ zero-dep single-file ESM, resolved in-browser by the import map.
   -> `onRestart` re-caches the engine ref and re-stamps the voice handles (restarts++).
   The listener state stays live and the viewport never stops. Mirror of market-map's
   Kill-feed.
+
+## Proven headless
+
+The two beats above are not just a browser demo -- they are pinned by **21 `node:test`
+gates** (`npm test`) over a headless `bootKernel` seam (inject a mock engine, no
+AudioContext required):
+
+- **census -> 0 on leave.** enterRoom stamps the live-node census (`6 + N*3`); leaveRoom
+  fires `roomScope.shutdown()` and the census returns to baseline `0`. Repeated
+  enter/leave never grows it.
+- **self-heal identity.** a fault builds a **fresh** engine on the **same shared ctx** --
+  the gate asserts a new instance is handed to `init(ctx)` with the ctx object unchanged.
+- **fail-closed parent + health.** the root refuses to shut down while a room is live;
+  `readyz` fails closed (no engine -> not ready).
+- **reverse-topo teardown.** the teardown order is asserted from the engine's **observed**
+  `onTeardown` fires, not a hardcoded list.
+
+**Fidelity boundary (honest):** these gates prove the DI **lifecycle** + the census
+**model** against a MOCK engine -- NOT real `AudioNode` disconnection. This is the same
+boundary as `../market-map/`'s fake socket. The census is MODELED from engine state
+(`censusOf`; see the **Real node census** seam below); the browser demo drives the real
+`@zakkster/lite-audio` graph. An armed canary (`AR_BREAK=1`, a no-op engine destroy)
+makes the census gate go RED on demand, so the gate is falsifiable, not a tautology.
 
 ## Corrected architecture (vs the naive mapping)
 

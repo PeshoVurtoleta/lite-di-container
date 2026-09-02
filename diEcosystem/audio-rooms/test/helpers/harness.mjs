@@ -55,6 +55,11 @@ export function makeMock2d() {
 export function makeFakeEngine(opts = {}) {
     const engines = [];
     let reused = null;
+    // AR_BREAK=1 GLOBALLY arms the breakDestroy canary (a no-op destroy) so the CI
+    // break-gate can prove the census gate is falsifiable end-to-end: with it set, G1's
+    // "census -> 0 after leaveRoom" assertion reds and `npm test` exits non-zero. Read
+    // once at mock construction (cold); a per-test `opts.breakDestroy` still arms it too.
+    const breakDestroy = opts.breakDestroy || process.env.AR_BREAK === '1';
     const build = () => {
         const eng = {
             id: engines.length,
@@ -72,7 +77,7 @@ export function makeFakeEngine(opts = {}) {
             activeCount(bus) { return this.voices; },
             destroy() {
                 this.destroyed = true;
-                if (opts.breakDestroy) return;   // CANARY: never frees -> census stays > 0
+                if (breakDestroy) return;   // CANARY: never frees -> census stays > 0
                 this.live = 0;
                 this.voices = 0;
                 this.ctx = null;
