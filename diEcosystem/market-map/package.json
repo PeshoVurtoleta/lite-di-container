@@ -11,6 +11,7 @@
     "verify": "npm test && npm run torture && npm run alloc && npm run churn"
   },
   "dependencies": {
+    "@zakkster/lite-devtools": "1.5.0",
     "@zakkster/lite-di-container": "2.2.0",
     "@zakkster/lite-di-cron": "1.0.0",
     "@zakkster/lite-di-event-bus": "1.1.0",

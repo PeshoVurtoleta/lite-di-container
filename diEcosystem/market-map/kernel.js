@@ -22,11 +22,25 @@ import {fromContainer, toJSON, toDOT, toChromeTrace} from '@zakkster/lite-di-gra
 import {createSignalScope, reactiveService, SIGNAL_REGISTRY_TOKEN} from '@zakkster/lite-di-signal';
 import {createRegistry} from '@zakkster/lite-signal';
 import {defineReactive, disposeReactive, costOf, capacityFor,
-    releaseReactive, reinitReactive, costOfInstance, snapshotOf} from '@zakkster/lite-signal-decorators';
+    releaseReactive, reinitReactive, costOfInstance, snapshotOf,
+    rootOf, labelOf, enableLabels, forEachReactive} from '@zakkster/lite-signal-decorators';
+// S10: devtools' `toDot` renders the {nodes,edges} the demo's cold registry-explicit BFS
+// builds. ALIASED as rxToDot -- di-graph's `toDOT` (the DI container graph, imported above)
+// differs only by case, and two same-cased-only names in one file is a readability trap.
+import {toDot as rxToDot} from '@zakkster/lite-devtools';
 import {createSocketFactory} from '@zakkster/lite-ws';
 import {RingBuffer} from '@zakkster/lite-ring-buffer';
 import {TAG_QUOTE, TAG_DEPTH, TAG_TRADE, MAXLVL, parseFrame, OrderBook} from './Frames.js';
 import {createWatchlist} from './watchlist.js';
+
+// S10 T2 -- the enableLabels ordering trap (RECONCILIATION C5). Labels register at WIRING
+// time; a VM wired while labels are OFF registers NO labels and labelOf returns undefined
+// for its ids FOREVER. So this MUST run at MODULE TOP LEVEL, before ANY VM is wired --
+// INCLUDING the module-load _ProbeVM below. ?labels=0 opts out; a headless / no-URL context
+// defaults to labels ON (fail closed toward the labeled graph the demo promises).
+const _labelsOn = !(typeof location !== 'undefined'
+    && new URLSearchParams(location.search).get('labels') === '0');
+enableLabels(_labelsOn);
 
 // lite-gl/backend is loaded COLD (not a static import) so bootKernel can run headless
 // under node:test, where WebGL is absent. The dynamic import is awaited once, only when
@@ -149,6 +163,113 @@ export function makeSymbolVM(registry) {
         dispose() { disposeReactive(this); }
     }
     return defineReactive(SymbolVMBase, {host: {registry}, ...SYMBOL_VM_SPEC});
+}
+
+// S10 T3 -- per-scope label resolver (COLD, one per scope). The registry argument is
+// MANDATORY: labelOf defaults to lite-signal's frozen DEFAULT registry when omitted, and the
+// scope VMs live on PER-SCOPE registries, so an omitted registry resolves EVERY id to
+// undefined -> a silently unlabeled graph. Bind the resolver to THIS scope's registry.
+export function makeLabelResolver(registry) {
+    // Fail closed (mirrors makeSymbolVM): labelOf silently defaults to lite-signal's frozen
+    // DEFAULT registry when the arg is nullish -> every scoped id resolves to undefined and
+    // the graph renders unlabeled. An absent scope registry is an error, not a default.
+    if (!registry) throw new TypeError('makeLabelResolver: a scope registry is required (refusing the default registry -> all-undefined)');
+    return (id) => labelOf(id, registry);
+}
+
+// S10 T4 -- the cold registry-explicit BFS (RECONCILIATION C2 -- Approach B). devtools'
+// module-level graph() walks the DEFAULT registry only, so a scoped VM would render EMPTY;
+// setDefaultRegistry is unrestorable (fail-open, REJECTED). Instead build {nodes,edges}
+// ourselves over the SCOPE registry's own introspection (describe/nodeId/forEach*), edge-
+// deduped, then hand it to rxToDot. COLD ONLY: allocates Maps/arrays -- never per frame.
+// Exported so the S10 gate asserts on the EXACT graph dotOf renders (not a parallel copy).
+export function reactiveGraphOf(reg, vm) {
+    const root = rootOf(vm);                       // throws ReactiveDisposedError on a parked/disposed VM
+    const nodes = new Map(), edges = [], eseen = new Set(), seen = new Set(), q = [];
+    const roots = [];
+    forEachReactive(vm, (h) => roots.push(h));
+    roots.push(root);
+    for (const h of roots) {
+        const d = reg.describe(h);
+        if (d && !nodes.has(d.id)) { nodes.set(d.id, d); q.push(h); }
+    }
+    const link = (f, t, k) => {
+        const key = f + '>' + t + (k ? ':' + k : '');
+        if (!eseen.has(key)) { eseen.add(key); edges.push(k ? {from: f, to: t, kind: k} : {from: f, to: t}); }
+    };
+    let head = 0;
+    while (head < q.length) {
+        const h = q[head++];
+        const id = reg.nodeId(h);
+        if (id === undefined || seen.has(id)) continue;
+        seen.add(id);
+        reg.forEachObserver(h, (d) => { if (!nodes.has(d.id)) nodes.set(d.id, d); link(id, d.id); q.push(d); });
+        reg.forEachSource(h, (d) => { if (!nodes.has(d.id)) nodes.set(d.id, d); link(d.id, id); q.push(d); });
+        reg.forEachOwned(h, (d) => { if (!nodes.has(d.id)) nodes.set(d.id, d); link(id, d.id, 'owner'); q.push(d); });
+    }
+    return {nodes: [...nodes.values()], edges};
+}
+
+// S10 -- DOT-safe cluster id from a symbol (ASCII word chars only). Fail closed on anything odd.
+function safeName(symbol) {
+    return String(symbol).replace(/[^A-Za-z0-9_]/g, '_');
+}
+
+// S10 T4 -- the full reactive digraph for ONE scope, or null if the VM is parked/disposed
+// (rootOf throws ReactiveDisposedError -> caught -> null, so a S9-parked watchlist entry is
+// skipped, never fatal). COLD ONLY (export button / graph page).
+function reactiveDotOf(symbol, reg, vm) {
+    try {
+        const g = reactiveGraphOf(reg, vm);
+        return rxToDot(g, {name: 'scope_' + safeName(symbol), labelResolver: makeLabelResolver(reg)});
+    } catch (e) {
+        return null;                               // parked/disposed VM -> skip, not fatal
+    }
+}
+
+// S10 -- namespace a cluster's bare DOT node identifiers so two scopes can share ONE digraph.
+// lite-signal numbers each registry's nodes from 1 (per-registry nodeSeq), and rxToDot emits
+// every id as a bare `n<num>` -- but Graphviz node identifiers are GLOBAL to the enclosing
+// digraph (a subgraph/cluster_ does NOT scope them), so two clusters both declaring `n1`
+// MERGE into one node. Rewrite `n<num>` -> `<prefix>n<num>` (prefix = safe symbol + '_'),
+// CONSISTENTLY on node-declaration lines AND every edge endpoint, so nothing dangles. Operate
+// per line on the portion BEFORE the first `[` only: the attribute bracket holds the quoted
+// label (`SymbolVMBase.bid` etc), which must never be rewritten. Bare-edge lines (no `[`)
+// have no label, so the whole line is rewritten. COLD (combined export path only).
+function namespaceDotIds(body, prefix) {
+    const lines = body.split('\n');
+    for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        const br = line.indexOf('[');
+        if (br < 0) {
+            lines[i] = line.replace(/\bn(\d+)\b/g, prefix + 'n$1');
+        } else {
+            lines[i] = line.slice(0, br).replace(/\bn(\d+)\b/g, prefix + 'n$1') + line.slice(br);
+        }
+    }
+    return lines.join('\n');
+}
+
+// S10 T5 -- the same reactive digraph stripped of its `digraph <name> {` prefix + trailing
+// `}` and re-wrapped as a `subgraph cluster_<sym>` with a one-line caption (the whole
+// legend). Returns null for a parked/absent scope so the combined export skips it. COLD.
+const RX_CAPTION = 'ellipse=signal, box=derived, diamond=effect, dashed=owner';
+function reactiveClusterOf(symbol, reg, vm) {
+    const dot = reactiveDotOf(symbol, reg, vm);
+    if (dot === null) return null;
+    const open = dot.indexOf('{'), close = dot.lastIndexOf('}');
+    if (open < 0 || close <= open) return null;    // fail closed on a malformed render
+    const inner = dot.slice(open + 1, close).replace(/^\n+|\n+$/g, '');
+    // The caption symbol runs through safeName too: a `"` or non-ASCII byte in a symbol would
+    // otherwise break the DOT label and the ASCII gate. Same sanitizer as the cluster id.
+    const safe = safeName(symbol);
+    // Namespace the node ids by the (safe) symbol so multiple clusters in one digraph never
+    // collide (Graphviz ids are digraph-global; subgraphs do not scope them).
+    const body = namespaceDotIds(inner, safe + '_');
+    return '  subgraph cluster_' + safe + ' {\n'
+        + '    label="' + safe + ' -- reactive scope (' + RX_CAPTION + ')";\n'
+        + body + '\n'
+        + '  }\n';
 }
 
 // Module-load validation probe (mitigates defineReactive's PENDING-poisoning: a throw
@@ -1297,6 +1418,15 @@ export async function bootKernel({ctx, gl, w, h, dpr, onEvent, onMode, ringSize,
         throw new TypeError('bootKernel: @zakkster/lite-signal-decorators is missing the park/revive '
             + 'surface (releaseReactive/reinitReactive/costOfInstance/snapshotOf) -- pin >= 1.5.0 in the import map');
     }
+    // S10 -- the labeled-graph surface an OLD esm.sh build would lack. rootOf/labelOf/
+    // enableLabels/forEachReactive come from decorators >= 1.5.0; rxToDot from lite-devtools
+    // >= 1.5.0. Fail closed HERE, before wiring, with a NAMED error. null is not a function.
+    if (typeof rootOf !== 'function' || typeof labelOf !== 'function'
+        || typeof enableLabels !== 'function' || typeof forEachReactive !== 'function' || typeof rxToDot !== 'function') {
+        throw new TypeError('bootKernel: the labeled-graph surface is missing '
+            + '(decorators rootOf/labelOf/enableLabels/forEachReactive + devtools toDot) -- pin '
+            + '@zakkster/lite-signal-decorators >= 1.5.0 and @zakkster/lite-devtools >= 1.5.0 in the import map');
+    }
     // ?faultyTeardown read ONCE, cold, at boot (never on the hot path).
     const params = typeof location !== 'undefined' ? new URLSearchParams(location.search) : null;
     const faulty = !!(params && params.has('faultyTeardown'));
@@ -1632,7 +1762,23 @@ export async function bootKernel({ctx, gl, w, h, dpr, onEvent, onMode, ringSize,
             try {
                 const snap = fromContainer(c);
                 if (kind === 'json') return {name: 'market-map-graph.json', mime: 'application/json', text: toJSON(snap)};
-                if (kind === 'dot') return {name: 'market-map-graph.dot', mime: 'text/vnd.graphviz', text: toDOT(snap)};
+                if (kind === 'dot') {
+                    // S10 T5 -- ONE .dot: the di-graph container digraph with, NESTED inside it,
+                    // one `subgraph cluster_<sym>` per LIVE scope (the reactive plane). Parked/
+                    // disposed scopes (reactiveClusterOf -> null) are skipped. Subgraphs must sit
+                    // INSIDE the digraph, so splice them in before its final `}`.
+                    let text = toDOT(snap);
+                    const at = text.lastIndexOf('}');
+                    if (at >= 0) {
+                        let clusters = '';
+                        for (const [sym, h] of scopes) {
+                            const block = reactiveClusterOf(sym, h.registry, h.vm);
+                            if (block) clusters += block;
+                        }
+                        if (clusters) text = text.slice(0, at) + clusters + text.slice(at);
+                    }
+                    return {name: 'market-map-graph.dot', mime: 'text/vnd.graphviz', text};
+                }
                 if (kind === 'trace') return {name: 'market-map-graph.trace.json', mime: 'application/json', text: toChromeTrace(snap)};
                 log('down', 'graph export failed: unknown kind ' + String(kind));
                 return null;
@@ -1647,6 +1793,13 @@ export async function bootKernel({ctx, gl, w, h, dpr, onEvent, onMode, ringSize,
             } catch {
                 return 0;
             }
+        },
+        // S10 T4 -- the labeled reactive digraph for ONE live scope, or null if the symbol is
+        // absent or its VM is parked/disposed (fail closed). COLD: export button / graph page.
+        dotOf(symbol) {
+            const h = scopes.get(symbol);
+            if (!h) return null;
+            return reactiveDotOf(symbol, h.registry, h.vm);
         },
         setSource(u) {
             const h = active();

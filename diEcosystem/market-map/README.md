@@ -102,7 +102,7 @@ pin-bump procedure).
 
 ## What each package does here
 
-One row per import-map entry in `index.html` (16 specifiers). The **Version** column
+One row per import-map entry in `index.html` (17 specifiers). The **Version** column
 is the exact CDN pin -- the import map is the single source of truth.
 
 | Package | Version | Role in the demo |
@@ -118,7 +118,8 @@ is the exact CDN pin -- the import map is the single source of truth.
 | `lite-di-signal` | 1.0.0 | the reactive control surface -- a **handful** of aggregates (mid / bid / ask / spread), NOT one signal per tick |
 | `lite-raf` | 1.2.0 | the `requestAnimationFrame` frame source under `lite-di-ticker` (fails closed with no global rAF) |
 | `lite-signal` | 1.5.0 | the underlying reactive cell primitive the aggregate signals are built on |
-| `lite-signal-decorators` | 1.5.0 | `defineReactive` builds each symbol scope's 10-node view-model (bid/ask/last -> mid/spread deriveds + a `localTo` alert) on the scope's OWN registry; disposed with the scope |
+| `lite-signal-decorators` | 1.5.0 | `defineReactive` builds each symbol scope's 10-node view-model (bid/ask/last -> mid/spread deriveds + a `localTo` alert) on the scope's OWN registry; disposed with the scope. `labelOf` / `rootOf` name every reactive node for the S10 graph export |
+| `lite-devtools` | 1.5.0 | renders each live scope's reactive dependency graph as labeled Graphviz **DOT** via `toDot({ labelResolver })` -- every node prints its decorated member name (`SymbolVMBase.bid`, `SymbolVMBase#onQuote`, `SymbolVMBase@anchor`); the combined `.dot` export nests one `subgraph cluster_<symbol>` per live scope inside the container graph, node ids namespaced per scope |
 | **`lite-ws`** | 1.0.0 | the **real WebSocket feed**: `onMessage` pipes each decoded frame to the bus (0-GC), while `status` / `latency` / `reconnectAttempts` stay coarse reactive signals; built-in reconnect + backoff. Selectable at runtime between a **live Binance combined stream** (default; `@depth20@100ms` + `@aggTrade` + `@bookTicker` over wss, no auth), an **in-page simulation** (synthetic random walk, the supervised failover), and the local `feed-server` |
 | **`lite-ring-buffer`** | 1.0.1 | the pow2, bitmask-wrap `Float32Array` tick ring -- the 0-GC hot data the firehose lands in |
 | **`lite-gl`** | 2.0.0 | instanced WebGL2 renderer: the tick cloud via `createPointSink` **and the depth ladder via `createQuadSink`** (the whole order book on the GPU); scales to ~1M primitives |
@@ -128,6 +129,25 @@ The headline beat: click **Kill feed** -- the supervisor faults the feed subsyst
 down the old `lite-ws` socket, and re-resolves a fresh one (restarts++, transport
 `reconnecting` -> `open`) while the viewport keeps rendering. That is the golden niche in
 miniature: self-healing, fail-closed, zero-GC steady state -- over a real socket.
+
+## The combined claim
+
+A DI kernel whose **every scope owns a disposable, measured, zero-GC reactive class
+layer** -- and can draw itself. Three receipts, each a shipped gate, not a slogan:
+
+- **S8 -- retention 0.** Each symbol tab is a child scope carrying a `defineReactive`
+  view-model on its OWN registry; open/close 4096 times and the leak gate measures
+  `live 0/0` (the VM, its registry, its socket all die with the scope).
+- **S9 -- pool delta 0.** Watchlist remove *parks* the VM (`releaseReactive`), re-add
+  *revives the same object* (`reinitReactive`); 4096 park/revive cycles net **zero**
+  node growth -- subscribe/unsubscribe churn at no allocation.
+- **S10 -- the labeled DOT.** Every live scope renders its reactive dependency graph as
+  Graphviz DOT with each node carrying its decorated member name (`SymbolVMBase.bid`,
+  `#onQuote`, `@anchor`), and the whole kernel exports as **one** `.dot` -- the
+  `lite-di-graph` container graph with one `subgraph cluster_<symbol>` per live scope
+  nested inside it (node ids namespaced per scope so two symbols never collide). The
+  graph is the *live* topology: a scope that has taken a quote settles at 7 reachable
+  reactive nodes (the `localTo` alert joins only in the pristine, pre-tick window).
 
 ## Corrected architecture (vs the naive mapping)
 
