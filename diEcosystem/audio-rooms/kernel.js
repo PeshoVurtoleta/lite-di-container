@@ -117,7 +117,7 @@ const ROOMS = {
 function makeWorld(c2d, w, h) {
     return {
         c2d, w, h, view: 1.4, router: null, setMode: null,
-        glSink: null,
+        glSink: null, shuttingDown: false,      // fail-closed: freeze the render loop before a root teardown
         roomId: null, engine: null, count: 0, range: ROOM_RANGE, layout: 'stereo',
         reverb: '',                             // room reverb tag (read every frame in the footer)
         facing: 0,                              // listener heading (radians), game state
@@ -362,7 +362,9 @@ class RenderSystem {
 
     update(dt) {
         const w = this.world;
-        if (!w.router) return;
+        // Fail closed: once a root teardown is in flight the container is (or is about to
+        // be) shut down, so router.resolve() -> c.get() would throw. Freeze the loop.
+        if (w.shuttingDown || !w.router) return;
         const eng = w.engine;
         const n = w.count;
         w.facing += 0.0004 * dt;                       // listener slowly turns (game state)
@@ -383,7 +385,7 @@ class RenderSystem {
 // ===========================================================================
 //  bootKernel -- ROOT scope: shared ctx, assets cache, the render ticker.
 // ===========================================================================
-export async function bootKernel({ctx, c2d, gl, w, h, onEvent, onMode}) {
+export async function bootKernel({ctx, makeEngine = () => new LiteAudio(), c2d, gl, w, h, onEvent, onMode}) {
     const log = (kind, msg) => onEvent && onEvent(kind, msg);
     const world = makeWorld(c2d, w, h);
     world.setMode = onMode || null;             // toggle 2d <-> gl canvas (strategies swap)
@@ -477,7 +479,7 @@ export async function bootKernel({ctx, c2d, gl, w, h, onEvent, onMode}) {
         // ONE LiteAudio engine per room scope, sharing the ROOT ctx. Async singleton so a
         // supervised restart (getAsync) rebuilds a fully-initialized engine on the SAME ctx.
         roomScope.singletonFactoryAsync('engine', async (c) => {
-            const e = new LiteAudio();
+            const e = makeEngine();
             await e.init(ctx);                                // PASS the shared ctx -- never a new one
             e.createBus('world', {spatial: 'positional'});    // mode frozen HERE (correction 5)
             await e.defineSounds(sounds);
@@ -601,7 +603,9 @@ export async function bootKernel({ctx, c2d, gl, w, h, onEvent, onMode}) {
                     voices = world.count;
                 }
             }
-            let readyz = 0, livez = 0, facing = 0, reverb = '', emitters = 0, housekeeps = 0, supState = -1;
+            // Fail closed: with no room there is no health probe, so readyz defaults to
+            // not-ready (1). null is not zero -- an unwired readiness lane is NOT ready.
+            let readyz = 1, livez = 0, facing = 0, reverb = '', emitters = 0, housekeeps = 0, supState = -1;
             if (health) {
                 readyz = health.readyz();
                 livez = health.livez();
@@ -631,18 +635,29 @@ export async function bootKernel({ctx, c2d, gl, w, h, onEvent, onMode}) {
         // The parent refuses to shut down while a room scope is live (correction 1). This
         // surfaces that fail-closed guard for the teardown beat.
         shutdownRoot() {
+            world.shuttingDown = true;                        // freeze the render loop before teardown
             root.shutdown().then(
                 () => log('replay', 'root scope shut down'),
-                (e) => log('escalate', 'root refused shutdown: ' + (e && e.message ? e.message : String(e))),
+                (e) => {
+                    world.shuttingDown = false;               // refused (child still live) -- keep rendering
+                    log('escalate', 'root refused shutdown: ' + (e && e.message ? e.message : String(e)));
+                },
             );
         },
         stop() {
+            world.shuttingDown = true;                        // terminal: no more frames off a dead graph
             if (facingTimer) clearInterval(facingTimer);
             ticker.stop();
             if (cron) try {
                 cron.stop();
             } catch {
             }
+        },
+        // Test-only seam (headless node:test). Exposes the live room child scope so a gate
+        // can observe the container's REAL reverse-topological teardown fires. null == no
+        // room live (fail-closed: absence is not an empty success). Not used by the browser.
+        get _roomScope() {
+            return roomScope;
         },
     };
 }

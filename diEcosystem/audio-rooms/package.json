@@ -1,0 +1,25 @@
+{
+  "name": "@zakkster/audio-rooms-demo",
+  "private": true,
+  "type": "module",
+  "description": "Unpublished demo of the @zakkster/lite-di-* service kernel applied to scoped Web Audio rooms. Not on npm; dependency versions are pinned to match index.html's import map (the browser source of truth).",
+  "scripts": {
+    "test": "node --test --test-force-exit test/*.test.mjs"
+  },
+  "dependencies": {
+    "@zakkster/lite-di-container": "2.2.0",
+    "@zakkster/lite-di-cron": "1.0.0",
+    "@zakkster/lite-di-event-bus": "1.1.0",
+    "@zakkster/lite-di-graph": "1.0.0",
+    "@zakkster/lite-di-health": "1.0.0",
+    "@zakkster/lite-di-signal": "1.0.0",
+    "@zakkster/lite-di-strategies": "1.0.0",
+    "@zakkster/lite-di-supervisor": "1.0.0",
+    "@zakkster/lite-di-ticker": "1.0.0",
+    "@zakkster/lite-audio": "2.5.1",
+    "@zakkster/lite-audio-pool": "1.4.0",
+    "@zakkster/lite-gl": "2.0.0",
+    "@zakkster/lite-raf": "1.2.0",
+    "@zakkster/lite-signal": "1.5.0"
+  }
+}
