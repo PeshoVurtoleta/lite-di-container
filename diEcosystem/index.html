@@ -1108,6 +1108,56 @@
 
 <section>
     <div class="wrap">
+        <div class="proof-grid">
+            <div class="proof-copy reveal">
+                <p class="eyebrow">The reactive plane</p>
+                <h2>Every scope draws itself.</h2>
+                <p>In the <a href="market-map/">market-map</a> demo, one symbol tab is one child
+                    scope: one <code>lite-signal</code> registry, one <code>defineReactive</code>
+                    view-model fleet (<code>lite-signal-decorators</code>), all disposed together.
+                    Because the view-model's members are decorated, the scope can render its own
+                    live dependency graph &mdash; <code>lite-devtools</code>' <code>toDot({ labelResolver })</code>
+                    with the decorators' <code>labelOf</code> bound to that scope's registry, so every
+                    node prints its member name.</p>
+                <p>The whole kernel exports as <em>one</em> <code>.dot</code>: the
+                    <code>lite-di-graph</code> container graph with one <code>subgraph cluster_&lt;symbol&gt;</code>
+                    per live scope nested inside it (node ids namespaced per scope so two symbols never
+                    collide). The graph is the <em>live</em> topology &mdash; a scope that has taken a
+                    quote settles at seven reachable reactive nodes.</p>
+                <div class="order reveal">
+                    <span class="c" style="color:var(--muted)">// paste into any DOT viewer &mdash; no legend needed</span><br>
+                    ellipse <span class="arw">=</span> signal <span class="arw">&middot;</span> box
+                    <span class="arw">=</span> computed <span class="arw">&middot;</span> diamond
+                    <span class="arw">=</span> effect / anchor <span class="arw">&middot;</span> dashed
+                    <span class="arw">=</span> owner edge
+                </div>
+            </div>
+            <div class="reveal">
+<pre class="code"><span class="c">// one live scope, rendered by lite-devtools toDot()</span>
+digraph scope_BTCUSDT {
+  rankdir=LR;
+  node [fontname=<span class="s">"monospace"</span>];
+  n8  [label=<span class="s">"effect#8\nSymbolVMBase@anchor"</span>,   shape=diamond];
+  n11 [label=<span class="s">"effect#11\nSymbolVMBase#onQuote"</span>, shape=diamond];
+  n10 [label=<span class="s">"computed#10\nSymbolVMBase.spread"</span>, shape=box];
+  n9  [label=<span class="s">"computed#9\nSymbolVMBase.mid"</span>,    shape=box];
+  n5  [label=<span class="s">"signal#5\nSymbolVMBase.pinned"</span>,   shape=ellipse];
+  n2  [label=<span class="s">"signal#2\nSymbolVMBase.bid"</span>,      shape=ellipse];
+  n3  [label=<span class="s">"signal#3\nSymbolVMBase.ask"</span>,      shape=ellipse];
+  n8 -&gt; n11 [style=dashed, color=gray];  <span class="c">// anchor owns</span>
+  n8 -&gt; n10 [style=dashed, color=gray];
+  n8 -&gt; n9  [style=dashed, color=gray];
+  n9 -&gt; n11; n10 -&gt; n11; n5 -&gt; n11;     <span class="c">// deps feed onQuote</span>
+  n2 -&gt; n11; n3 -&gt; n11;
+  n2 -&gt; n9;  n3 -&gt; n9;  n2 -&gt; n10; n3 -&gt; n10;
+}</pre>
+            </div>
+        </div>
+    </div>
+</section>
+
+<section>
+    <div class="wrap">
         <p class="eyebrow reveal">Why it reads as one product</p>
         <h2 class="reveal">Eleven packages, one set of laws.</h2>
         <div class="laws reveal" style="margin-top:28px;">
