@@ -108,6 +108,18 @@
             .stage {
                 height: 60dvh;
             }
+
+            /* single column: no side panel to clear, so the pill sits top-right of the
+               full-width stage; the toast column drops below it so transient toasts do
+               not stack over the persistent bell. */
+            .nc-bell,
+            .nc-panel {
+                right: 1rem;
+            }
+
+            .toast-viewport {
+                top: 3.5rem;
+            }
         }
 
         .stage {
@@ -650,7 +662,9 @@
         .nc-bell {
             position: fixed;
             top: 1rem;
-            left: 1rem;
+            /* top-right of the chart, clear of the tab strip (left) and the toast column
+               (over the 21.25rem panel on the right) -- the pill no longer covers the tabs */
+            right: calc(21.25rem + 1rem);
             z-index: 61;
             appearance: none;
             display: inline-flex;
@@ -690,7 +704,7 @@
         .nc-panel {
             position: fixed;
             top: 3.2rem;
-            left: 1rem;
+            right: calc(21.25rem + 1rem);   /* drops down under the bell (same right anchor) */
             z-index: 61;
             width: min(20rem, 90vw);
             max-height: 60dvh;
@@ -798,16 +812,17 @@
         </div>
 
         <div class="group">
-            <h2>Strategy plane &middot; lite-di-strategies + Ichimoku</h2>
+            <h2>Strategy plane &middot; lite-di-strategies + Ichimoku / Alligator</h2>
             <div class="seg" id="ta-seg" role="group" aria-label="strategy">
                 <button type="button" class="seg-btn on" data-mode="off">OFF</button>
                 <button type="button" class="seg-btn" data-mode="ichimoku">ICHIMOKU</button>
+                <button type="button" class="seg-btn" data-mode="alligator">ALLIGATOR</button>
             </div>
             <div class="rows">
                 <div class="row"><span class="k">state</span><span class="v accent" id="ta-state">off</span></div>
-                <div class="row"><span class="k">tenkan / kijun</span><span class="v" id="ta-tk">--</span></div>
-                <div class="row"><span class="k">span A / B</span><span class="v" id="ta-span">--</span></div>
-                <div class="row"><span class="k">closed bars <small>78 to warm</small></span><span class="v" id="ta-bars">0</span></div>
+                <div class="row"><span class="k" id="ta-lbl-tk">tenkan / kijun</span><span class="v" id="ta-tk">--</span></div>
+                <div class="row"><span class="k" id="ta-lbl-span">span A / B</span><span class="v" id="ta-span">--</span></div>
+                <div class="row"><span class="k">closed bars <small><span id="ta-warmneed">78</span> to warm</small></span><span class="v" id="ta-bars">0</span></div>
             </div>
         </div>
 
@@ -1063,6 +1078,7 @@
         wlNodesDelta: $('wl-nodes-delta'),
         // S11 strategy plane HUD + lite-headless surfaces.
         taSeg: $('ta-seg'), taState: $('ta-state'), taTk: $('ta-tk'), taSpan: $('ta-span'), taBars: $('ta-bars'),
+        taLblTk: $('ta-lbl-tk'), taLblSpan: $('ta-lbl-span'), taWarmNeed: $('ta-warmneed'),
         ncBell: $('nc-bell'), ncBadge: $('nc-badge'), ncPanel: $('nc-panel'), ncList: $('nc-list'), ncClear: $('nc-clear'),
         toastVp: $('toast-vp'),
     };
@@ -1512,14 +1528,27 @@
         el.heap.textContent = s.heapMB == null ? 'n/a' : s.heapMB.toFixed(1) + ' MB';
         // S11 TA HUD -- change-gate the WHOLE line (the session-13 lesson). Writes only, no
         // layout reads. Warming/off spans render '--' (fmt gates NaN); never a 0-valued span.
-        const taLine = s.taState + '|' + s.tenkan + '|' + s.kijun + '|' + s.spanA + '|' + s.spanB + '|' + s.taBars;
+        const taLine = s.taMode + '|' + s.taState + '|' + s.tenkan + '|' + s.kijun + '|' + s.spanA + '|' + s.spanB
+            + '|' + s.jaw + '|' + s.teeth + '|' + s.lips + '|' + s.taBars + '|' + s.taWarmNeed;
         if (taLine !== lastTa) {
             lastTa = taLine;
             el.taState.textContent = s.taState;
             el.taState.className = 'v ' + (s.taState === 'bull' ? 'accent bull' : (s.taState === 'bear' ? 'bear' : 'accent'));
-            el.taTk.textContent = fmt(s.tenkan) + ' / ' + fmt(s.kijun);
-            el.taSpan.textContent = fmt(s.spanA) + ' / ' + fmt(s.spanB);
+            // S12 -- mode-aware readout: ichimoku shows tenkan/kijun + span A/B; alligator shows
+            // lips/teeth + jaw; off shows '--'. Labels relabel per mode; fmt() gates NaN to '--'.
+            if (s.taMode === 'alligator') {
+                el.taLblTk.textContent = 'lips / teeth';
+                el.taLblSpan.textContent = 'jaw';
+                el.taTk.textContent = fmt(s.lips) + ' / ' + fmt(s.teeth);
+                el.taSpan.textContent = fmt(s.jaw);
+            } else {
+                el.taLblTk.textContent = 'tenkan / kijun';
+                el.taLblSpan.textContent = 'span A / B';
+                el.taTk.textContent = fmt(s.tenkan) + ' / ' + fmt(s.kijun);
+                el.taSpan.textContent = fmt(s.spanA) + ' / ' + fmt(s.spanB);
+            }
             el.taBars.textContent = s.taBars;
+            el.taWarmNeed.textContent = s.taWarmNeed;
         }
         // Self-narrating soak line, change-gated on the WHOLE string (the audio-rooms lesson).
         const foot = 'uptime ' + upM + 'm -- ' + (s.longTasks < 0 ? 'n/a' : s.longTasks)

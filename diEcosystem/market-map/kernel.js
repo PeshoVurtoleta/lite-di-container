@@ -120,7 +120,18 @@ const DISP = 26;                   // cloud / chikou displacement
 const TA_WARM = SENB + DISP;       // = 78 closed bars before the evaluator computes
 const TA_COOLDOWN_BARS = 30;       // bars of edge suppression after an emitted signal
 const BAR_MS_DEFAULT = 1000;       // default candle timeframe (ms)
-const TA_MODES = ['off', 'ichimoku'];   // selectable strategies (S12 appends 'alligator')
+// S12 -- Williams Alligator: three SMMA (Wilder-smoothed) lines of the median price, each
+// displaced FORWARD. jaw is slowest+furthest, lips fastest+nearest. Reading a line "shifted
+// forward S" at the latest closed bar == the SMMA value at ring position back = S.
+const JAW_PERIOD = 13;             // slow line (blue): SMMA lookback
+const JAW_SHIFT = 8;               // ...displaced 8 bars forward
+const TEETH_PERIOD = 8;            // middle line (red)
+const TEETH_SHIFT = 5;
+const LIPS_PERIOD = 5;             // fast line (green)
+const LIPS_SHIFT = 3;
+const ALLIGATOR_WARM = JAW_PERIOD + JAW_SHIFT;   // = 21 closed bars (the jaw is the binding line)
+const GATOR_SPREAD_MIN = 0.0002;   // 2 bps mouth-open floor: below this the alligator sleeps (whipsaw filter)
+const TA_MODES = ['off', 'ichimoku', 'alligator'];   // selectable strategies (one at a time, global)
 // Feed sources. Each live symbol is ONE combined Binance stream carrying three
 // channels: depth20@100ms (the REAL 20-level ladder), aggTrade (the trade tape),
 // and bookTicker (a dense best-quote for the price trace). `sim` is the in-page
@@ -603,6 +614,11 @@ class TaPlane {
     // latest). Callers gate on count >= TA_WARM so the window is always fully populated.
     cAt(back) { return this.c[(this.head - 1 - back) & (TA_RING - 1)]; }
 
+    // S12 single-bar high/low reads (bar-close only, zero-alloc) for the Alligator median
+    // price (high + low) / 2. Same ring-index math as cAt; scalars only.
+    hAt(back) { return this.h[(this.head - 1 - back) & (TA_RING - 1)]; }
+    lAt(back) { return this.l[(this.head - 1 - back) & (TA_RING - 1)]; }
+
     // Rolling max(high)/min(low) over `len` bars ending `back` bars behind the latest, by
     // an O(len) backward ring scan (<= 52 iters at ~1 Hz). Scalars only -- zero allocation.
     maxH(len, back) {
@@ -709,6 +725,94 @@ class IchimokuEval {
     }
 }
 
+// S12 -- one displaced SMMA (Wilder) line of the median price, recomputed fresh from the ring
+// each bar (stateless -> re-arm is trivially correct, same posture as Ichimoku's recompute-
+// from-ring). NO per-call allocation: scalars only, one O(count) backward pass at ~1 Hz.
+// Read `shift` bars back (forward displacement). Caller guarantees plane.count >= period + shift.
+// Seed = SMA over the `period` OLDEST bars in the ring, then Wilder-recurse FORWARD (decreasing
+// back) down to back = shift, which is the value the forward-shifted line shows at the latest bar.
+function alligatorLine(plane, period, shift) {
+    const n = plane.count;
+    let seed = 0;
+    for (let k = 0; k < period; k++) {
+        const back = n - 1 - k;                        // the `period` oldest bars
+        seed += (plane.hAt(back) + plane.lAt(back)) / 2;
+    }
+    let smma = seed / period;                          // SMMA at back = n - period
+    for (let back = n - period - 1; back >= shift; back--) {
+        const med = (plane.hAt(back) + plane.lAt(back)) / 2;
+        smma = (smma * (period - 1) + med) / period;
+    }
+    return smma;                                       // SMMA at back = shift
+}
+
+// S12 T2 -- the Williams Alligator evaluator (per-scope singleton). Mirrors IchimokuEval on
+// structure byte-for-byte: transition state (prevState / lastBar / cooldown) + preallocated
+// readout fields (jaw/teeth/lips as NaN while warming -- null is not zero) + a string `state`.
+// Reads the plane only, never the scope vm (contract 1: a parked VM throws on every accessor).
+// Emission is the SOLE allocation point, reachable only through an edge + a clear cooldown.
+class AlligatorEval {
+    constructor() {
+        this.prevState = 0;            // numeric prior state (+1 bull / -1 bear / 0 neutral)
+        this.lastBar = -1;             // barIndex this evaluator last ran on (contract 2)
+        this.cooldown = 0;             // bars remaining before another edge may emit
+        this.jaw = NaN;                // readout fields: absent (NaN -> HUD '--') until warm
+        this.teeth = NaN;
+        this.lips = NaN;
+        this.state = 'warming';        // readout string: 'warming'|'neutral'|'bull'|'bear'
+    }
+
+    evaluate(plane, emit) {
+        // Contract 2 -- silent re-arm. An evaluator that did not run on bar i-1 (mode was 'off',
+        // the plane re-warmed, or the user just switched ichimoku->alligator) computes against a
+        // STALE prev, which is not an edge. Detect the gap, read out, resync without emitting.
+        const rearm = this.lastBar !== plane.barIndex - 1;
+        this.lastBar = plane.barIndex;
+        if (this.cooldown > 0) this.cooldown--;   // decrement per evaluated bar
+
+        if (plane.count < ALLIGATOR_WARM) {
+            // Warming: fail closed. No signal, no zero-valued lines (null is not zero).
+            this.state = 'warming';
+            this.jaw = this.teeth = this.lips = NaN;
+            this.prevState = 0;
+            return;
+        }
+
+        const jaw = alligatorLine(plane, JAW_PERIOD, JAW_SHIFT);
+        const teeth = alligatorLine(plane, TEETH_PERIOD, TEETH_SHIFT);
+        const lips = alligatorLine(plane, LIPS_PERIOD, LIPS_SHIFT);
+        const price = plane.cAt(0);
+
+        this.jaw = jaw;
+        this.teeth = teeth;
+        this.lips = lips;
+
+        // AWAKE = the mouth is open beyond the spread floor (the whipsaw filter). A sleeping
+        // alligator (lines braided) can never fire. STATE +1: awake AND lips > teeth > jaw AND
+        // price leading upward. STATE -1 mirrors every clause inverted. Fail closed on a
+        // non-positive price (out of contract -- a 0/NaN mid): no open mouth, no signal.
+        const awake = price > 0 && Math.abs(lips - jaw) / price >= GATOR_SPREAD_MIN;
+        let cur = 0;
+        if (awake && lips > teeth && teeth > jaw && price > lips) cur = 1;
+        else if (awake && lips < teeth && teeth < jaw && price < lips) cur = -1;
+
+        this.state = cur === 1 ? 'bull' : (cur === -1 ? 'bear' : 'neutral');
+
+        // A re-arm bar resyncs prev to the current state (no transition possible this bar).
+        if (rearm) {
+            this.prevState = cur;
+            return;
+        }
+        // Edge = transition INTO +1/-1 with a clear cooldown. The only alloc point, cold by
+        // construction (edge + cooldown gate the emit off the per-bar path).
+        if (cur !== this.prevState && cur !== 0 && this.cooldown === 0) {
+            this.cooldown = TA_COOLDOWN_BARS;
+            emit(cur === 1 ? 'buy' : 'sell');
+        }
+        this.prevState = cur;
+    }
+}
+
 // S11 T3 -- FOURTH tick handler (runs for depth AND quote frames, live / sim / inject).
 // [HOT] one method call into applyMid (2 compares + a store). Never reads the vm.
 class CandleApply {
@@ -736,7 +840,7 @@ class BarJob {
 // Exported for the headless alloc gate (test/alloc-ta.mjs), which drives the plane +
 // evaluator directly with a synthetic clock -- the same seam-under-test pattern Frames.js
 // gives OrderBook. TA_WARM/TA_RING are the warm threshold + ring depth the gate asserts on.
-export {TaPlane, IchimokuEval, TA_WARM, TA_RING};
+export {TaPlane, IchimokuEval, AlligatorEval, TA_WARM, ALLIGATOR_WARM, TA_RING};
 
 // ---- renderers (lite-di-strategies selects one by zoom) ----
 // Zero-steady-state-alloc price labels: reformat only when the quantized (0.1)
@@ -1312,6 +1416,7 @@ function createSymbolScope(parent, {symbol, url, log, faulty, ringSize, socketFa
     s.singletonFactory('ta', () => new TaPlane(barMs));
     s.value('ta:off', TA_OFF_EVAL);
     s.singletonFactory('ta:ichimoku', () => new IchimokuEval());
+    s.singletonFactory('ta:alligator', () => new AlligatorEval());   // S12: the second router-selected strategy
 
     const replayCtl = {on: false};                           // per-scope replay gate
     s.value('replayCtl', replayCtl);
@@ -1354,7 +1459,7 @@ function createSymbolScope(parent, {symbol, url, log, faulty, ringSize, socketFa
     // per-scope feed lifecycle + counters (all scope-local, no module globals)
     let feedUrl = url, sock = null;
     let quoteCount = 0, depthCount = 0, tradeCount = 0, qps = 0, trps = 0, lastQ = 0, lastT = 0;
-    let book = null, tape = null, vm = null, tradePx = null, tradeSide = null, ta = null, taEval = null;
+    let book = null, tape = null, vm = null, tradePx = null, tradeSide = null, ta = null, taEval = null, taGator = null;
     let alertResetPending = false;                            // set on unpin, cleared on the reset-logging quote
 
     // Single cold dispatch seam (the ONLY place the wire tag is inspected). book is
@@ -1533,6 +1638,7 @@ function createSymbolScope(parent, {symbol, url, log, faulty, ringSize, socketFa
     vm = s.get('vm');
     ta = s.get('ta');                                    // S11: resolve the plane right after vm (no teardown hook -> not in the walk)
     taEval = s.get('ta:ichimoku');                       // the ichimoku singleton (test seam + router target)
+    taGator = s.get('ta:alligator');                     // S12: the alligator singleton (test seam + router target)
     tradePx = s.get('trades:px');
     tradeSide = s.get('trades:side');
     s.get('bus');
@@ -1544,14 +1650,14 @@ function createSymbolScope(parent, {symbol, url, log, faulty, ringSize, socketFa
     const emitSignal = (side) => {
         const price = ta.cAt(0);
         const bar = ta.barIndex;
-        if (signal) signal({symbol, strategy: 'ichimoku', side, price, bar, at: performance.now()});
-        log('signal', symbol + ' STRONG ' + side.toUpperCase() + ' (ichimoku) @ ' + price.toFixed(2) + ' -- bar ' + bar);
+        if (signal) signal({symbol, strategy: taCtl.mode, side, price, bar, at: performance.now()});
+        log('signal', symbol + ' STRONG ' + side.toUpperCase() + ' (' + taCtl.mode + ') @ ' + price.toFixed(2) + ' -- bar ' + bar);
     };
     // Per-scope router: the global taCtl.mode gate selects a TRADING strategy token. resolve()
     // returns the SAME cached ta:off VALUE or ta:ichimoku singleton (== taEval), so the readout
     // fields state() reads are the ones evaluate() just wrote. Mode is global, one at a time.
     const taRouter = new StrategyRouter(s, {
-        strategies: {off: 'ta:off', ichimoku: 'ta:ichimoku'},
+        strategies: {off: 'ta:off', ichimoku: 'ta:ichimoku', alligator: 'ta:alligator'},
         gate: () => taCtl.mode,
     });
     ta.onBar = () => taRouter.resolve(taCtl.mode).evaluate(ta, emitSignal);
@@ -1567,7 +1673,7 @@ function createSymbolScope(parent, {symbol, url, log, faulty, ringSize, socketFa
     return {
         symbol, scope: s, registry: scopeReg, feedGate, nodeCount,   // registry + feedGate: S9 watchlist park/revive seams
         book, tape, vm, tradePx, tradeSide, feedPoll, inject,
-        ta, taEval,                                      // S11 test seams: the plane + the ichimoku evaluator
+        ta, taEval, taGator,                             // S11/S12 test seams: the plane + both evaluators
         sup,                                             // test seam (S6): heal.test.mjs reaches the per-scope supervisor to reportFault
         async start() {
             await sup.start();                               // resolves 'feed' -> opens the socket
@@ -1595,12 +1701,18 @@ function createSymbolScope(parent, {symbol, url, log, faulty, ringSize, socketFa
             // taState composes the display string; spans stay NaN (HUD '--') until warm AND
             // while the strategy is off -- null is not zero, an off/warming readout shows
             // absence, never a 0-valued or last-computed stale span.
-            const warm = ta.count >= TA_WARM;
-            const evOn = taCtl.mode !== 'off';
+            // S12: warm need is mode-dependent (alligator warms in 21 bars vs ichimoku's 78);
+            // the active evaluator supplies the state string. Indicator readouts are gated on
+            // their OWN mode -- ichimoku spans NaN in alligator mode and vice versa (absence,
+            // never a stale/0-valued span). taWarmNeed drives the HUD "to warm" hint.
+            const warmNeed = taCtl.mode === 'alligator' ? ALLIGATOR_WARM : TA_WARM;
+            const warm = ta.count >= warmNeed;
+            const isIchi = taCtl.mode === 'ichimoku';
+            const isGator = taCtl.mode === 'alligator';
             let taState;
             if (taCtl.mode === 'off') taState = 'off';
-            else if (!warm) taState = 'warming ' + ((ta.count / TA_WARM * 100) | 0) + '%';
-            else taState = taEval.state;
+            else if (!warm) taState = 'warming ' + ((ta.count / warmNeed * 100) | 0) + '%';
+            else taState = (isGator ? taGator : taEval).state;
             return {
                 mid: gLive ? vm.mid : 0, bid: gLive ? vm.bid : 0, ask: gLive ? vm.ask : 0,
                 spread: gLive ? vm.spread : 0, qps: tpsSig(), trps,
@@ -1609,9 +1721,11 @@ function createSymbolScope(parent, {symbol, url, log, faulty, ringSize, socketFa
                 readyz: health.readyz(), livez: health.livez(), supState: sup.state, restarts,
                 recorded: traceBus.recorded(), status, latency, attempts, open,
                 ticks: quoteCount + depthCount + tradeCount,
-                taState, taWarm: warm, taBars: ta.count,
-                tenkan: evOn ? taEval.tenkan : NaN, kijun: evOn ? taEval.kijun : NaN,
-                spanA: evOn ? taEval.spanA : NaN, spanB: evOn ? taEval.spanB : NaN,
+                taState, taWarm: warm, taBars: ta.count, taWarmNeed: warmNeed,
+                tenkan: isIchi ? taEval.tenkan : NaN, kijun: isIchi ? taEval.kijun : NaN,
+                spanA: isIchi ? taEval.spanA : NaN, spanB: isIchi ? taEval.spanB : NaN,
+                jaw: isGator ? taGator.jaw : NaN, teeth: isGator ? taGator.teeth : NaN,
+                lips: isGator ? taGator.lips : NaN,
             };
         },
         // Alert threshold pin/unpin (cold, one click per intent). Pin freezes the tracked
@@ -1995,7 +2109,9 @@ export async function bootKernel({ctx, gl, w, h, dpr, onEvent, onMode, onSignal,
                 ringUse: 0, burstActive: viz.burstActive,
                 // S11 TA plane (global mode + active scope's readout; absent-safe defaults).
                 taMode: taCtl.mode, taState: 'off', taWarm: false, taBars: 0,
+                taWarmNeed: taCtl.mode === 'alligator' ? ALLIGATOR_WARM : TA_WARM,
                 tenkan: NaN, kijun: NaN, spanA: NaN, spanB: NaN,
+                jaw: NaN, teeth: NaN, lips: NaN,
             };
             if (!h) return base;
             const st = h.state();
@@ -2023,10 +2139,14 @@ export async function bootKernel({ctx, gl, w, h, dpr, onEvent, onMode, onSignal,
             base.taState = st.taState;
             base.taWarm = st.taWarm;
             base.taBars = st.taBars;
+            base.taWarmNeed = st.taWarmNeed;
             base.tenkan = st.tenkan;
             base.kijun = st.kijun;
             base.spanA = st.spanA;
             base.spanB = st.spanB;
+            base.jaw = st.jaw;
+            base.teeth = st.teeth;
+            base.lips = st.lips;
             return base;
         },
         setZoom(z) {

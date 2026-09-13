@@ -246,13 +246,14 @@ per-scope `defineReactive` wrapper class all survive. Three caveats worth statin
   below the ceiling until every derived has been exercised. Size a registry from `costOf`,
   never from the live probe.
 
-### The strategy plane (Ichimoku signals)
+### The strategy plane (Ichimoku + Alligator signals)
 
 The **Strategy plane** panel adds a per-scope TA (technical-analysis) lane on top of the
 same tick firehose. It is `lite-di-strategies` finally selecting a TRADING strategy rather
-than a renderer: a segmented `OFF | ICHIMOKU` control drives a per-scope `StrategyRouter`
-whose tokens are `ta:off` (a frozen no-op) and `ta:ichimoku` (an Ichimoku Cloud evaluator).
-The mode is global and off by default; one strategy runs at a time, and it is off-able.
+than a renderer: a segmented `OFF | ICHIMOKU | ALLIGATOR` control drives a per-scope
+`StrategyRouter` whose tokens are `ta:off` (a frozen no-op), `ta:ichimoku` (an Ichimoku
+Cloud evaluator), and `ta:alligator` (a Williams Alligator evaluator). The mode is global
+and off by default; one strategy runs at a time, and it is off-able.
 
 - **Non-reactive, per-symbol, zero-GC.** The plane (`TaPlane`) is a plain class holding four
   `Float32Array` OHLC candle rings -- it registers ZERO `lite-signal` nodes and never reads
@@ -280,9 +281,24 @@ The mode is global and off by default; one strategy runs at a time, and it is of
   Both are wired with the FACTORIES (`createToast` / `createNotificationCenter`); the
   `/element` wrappers are never imported. Absent `onSignal` (headless), the edge still logs.
 
-These are the textbook Ichimoku indicator definitions rendered for a demo -- **not trading
-advice.** (`Float32` mids at six-figure prices carry a ~0.01 quantum; indicator comparisons
-are relative, so this is fine for the demo, same posture as the tape ring.)
+- **Alligator = a second strategy on the same plane.** Selecting `ALLIGATOR` routes the same
+  candle plane through a `ta:alligator` evaluator with ZERO new plumbing -- no new package,
+  stream, reactive node, or import-map entry. It is Bill Williams' Alligator: three SMMA
+  (Wilder-smoothed) moving averages of the median price `(high + low) / 2`, each displaced
+  FORWARD -- jaw (`SMMA(13)` shifted 8 bars), teeth (`SMMA(8)` shifted 5), lips (`SMMA(5)`
+  shifted 3). A strong BUY is the mouth open UPWARD with price leading: the alligator AWAKE
+  (`abs(lips - jaw) / price >= 2 bps`, the whipsaw filter -- a sleeping, braided alligator
+  emits nothing) AND `lips > teeth > jaw` AND `price > lips`; a strong SELL mirrors every
+  clause. Each line is recomputed fresh from the ring every bar (stateless -> the silent
+  re-arm is trivially correct, same posture as Ichimoku), so the evaluator holds only scalar
+  transition state and is 0-alloc at bar close. It warms in `JAW_PERIOD + JAW_SHIFT = 21`
+  closed bars (vs Ichimoku's 78), so at `?bar=250` a live toast fires in ~5 s -- the
+  fast-warm browser hook. The HUD relabels to `lips / teeth` + `jaw` and its "to warm" hint
+  follows the active mode (21 vs 78).
+
+These are the textbook Ichimoku and Alligator indicator definitions rendered for a demo --
+**not trading advice.** (`Float32` mids at six-figure prices carry a ~0.01 quantum; indicator
+comparisons are relative, so this is fine for the demo, same posture as the tape ring.)
 
 ## Perf & exports
 
