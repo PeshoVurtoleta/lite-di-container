@@ -108,6 +108,19 @@ const POLL_MS = 100;               // per-scope background-ingest poll cadence (
 const TAU = Math.PI * 2;
 const DOT_BUY = '#4EE7D2';         // taker-buy trade dot (teal)
 const DOT_SELL = '#F5A623';        // taker-sell trade dot (ember)
+// S11 -- the technical-analysis (TA) plane. A fixed-timeframe OHLC candle ring aggregated
+// from f.mid at the dispatch seam + an Ichimoku Cloud evaluator selected by a per-scope
+// StrategyRouter. NON-reactive by construction: zero new lite-signal nodes (the S8/S10
+// count gates stay untouched), the plane owns Float32 rings only. All lookbacks are bars.
+const TA_RING = 128;               // candle ring depth (pow2); catch-up beyond this re-warms
+const TENKAN = 9;                  // conversion-line lookback
+const KIJUN = 26;                  // base-line lookback
+const SENB = 52;                   // leading-span-B lookback
+const DISP = 26;                   // cloud / chikou displacement
+const TA_WARM = SENB + DISP;       // = 78 closed bars before the evaluator computes
+const TA_COOLDOWN_BARS = 30;       // bars of edge suppression after an emitted signal
+const BAR_MS_DEFAULT = 1000;       // default candle timeframe (ms)
+const TA_MODES = ['off', 'ichimoku'];   // selectable strategies (S12 appends 'alligator')
 // Feed sources. Each live symbol is ONE combined Binance stream carrying three
 // channels: depth20@100ms (the REAL 20-level ladder), aggTrade (the trade tape),
 // and bookTicker (a dense best-quote for the price trace). `sim` is the in-page
@@ -506,6 +519,224 @@ class FailoverJob {
         }
     }
 }
+
+// S11 T1 -- the per-scope TA plane. A plain class (NON-reactive: no lite-signal nodes, the
+// A3 registry floor of 11 stays untouched). Four Float32 rings hold closed-bar OHLC; the
+// open bucket is scalar. applyMid is HOT (compares + one store, no time read); roll is the
+// cold lane (run()-driven AND test-callable with a synthetic clock) that closes bars.
+class TaPlane {
+    constructor(barMs) {
+        this.barMs = barMs > 0 ? barMs : BAR_MS_DEFAULT;   // fail closed: a <=0 timeframe would spin roll()
+        this.o = new Float32Array(TA_RING);
+        this.h = new Float32Array(TA_RING);
+        this.l = new Float32Array(TA_RING);
+        this.c = new Float32Array(TA_RING);
+        this.head = 0;                 // index of the NEXT ring slot to write (bitmask wrap)
+        this.count = 0;                // closed bars in the ring (saturates at TA_RING)
+        this.barIndex = -1;            // monotonic index of the latest CLOSED bar; never wraps
+        this.bo = 0; this.bh = 0; this.bl = 0; this.bc = 0;   // open-bucket OHLC scalars
+        this.bucketOpen = false;       // false until the first tick opens a bucket
+        this.barStart = 0;             // wall-clock stamp of the current open bucket (set by roll)
+        this.started = false;          // false until roll() stamps the first barStart
+        this.onBar = null;             // bar-close hook (router.resolve(mode).evaluate) -- cold
+        this.onDegrade = null;         // stall re-warm log hook (contract 3) -- cold
+    }
+
+    // [HOT] one bucketOpen read + 2 compares + 1 store. No time read here -- roll stamps
+    // barStart. The bucket is opened once (first tick ever) then carried across closes.
+    applyMid(mid) {
+        if (!this.bucketOpen) {
+            this.bo = this.bh = this.bl = this.bc = mid;
+            this.bucketOpen = true;
+            return;
+        }
+        if (mid > this.bh) this.bh = mid;
+        if (mid < this.bl) this.bl = mid;
+        this.bc = mid;
+    }
+
+    // Cold lane. First call stamps barStart. Contract 3: behind by more than TA_RING bars
+    // (hidden-tab throttle / laptop sleep, the S5 lesson) -> reset the rings, re-enter
+    // WARMING, log 'degrade' once -- honest re-warm beats fabricating a ring of flat bars.
+    // Otherwise close one bar per elapsed barMs, firing the evaluator hook at each close.
+    roll(now) {
+        if (!this.started) {
+            this.started = true;
+            this.barStart = now;
+            return;
+        }
+        if (now - this.barStart >= this.barMs * (TA_RING + 1)) {
+            this.head = 0;
+            this.count = 0;
+            this.bucketOpen = false;       // barIndex stays monotonic; count re-gates warming
+            this.barStart = now;
+            if (this.onDegrade) this.onDegrade();
+            return;
+        }
+        while (now - this.barStart >= this.barMs) {
+            this.closeBar();
+            this.barStart += this.barMs;
+        }
+    }
+
+    // Close the open bucket into the rings. No tick this bar -> carry the prior close
+    // forward as a flat OHLC bar. Reopen the next bucket AT the prior close, so candles are
+    // continuous (a bar opens where the last one closed) until a tick moves it.
+    closeBar() {
+        let o, hi, lo, cl;
+        if (this.bucketOpen) {
+            o = this.bo; hi = this.bh; lo = this.bl; cl = this.bc;
+        } else {
+            o = hi = lo = cl = this.bc;    // no bucket -> flat carry-forward
+        }
+        const i = this.head;
+        this.o[i] = o; this.h[i] = hi; this.l[i] = lo; this.c[i] = cl;
+        this.head = (this.head + 1) & (TA_RING - 1);
+        if (this.count < TA_RING) this.count++;
+        this.barIndex++;
+        this.bo = this.bh = this.bl = this.bc = cl;
+        this.bucketOpen = true;
+        if (this.onBar) this.onBar();
+    }
+
+    // Cold ring reads (bar-close only). `back` = bars behind the latest CLOSED bar (0 =
+    // latest). Callers gate on count >= TA_WARM so the window is always fully populated.
+    cAt(back) { return this.c[(this.head - 1 - back) & (TA_RING - 1)]; }
+
+    // Rolling max(high)/min(low) over `len` bars ending `back` bars behind the latest, by
+    // an O(len) backward ring scan (<= 52 iters at ~1 Hz). Scalars only -- zero allocation.
+    maxH(len, back) {
+        const mask = TA_RING - 1;
+        let idx = (this.head - 1 - back) & mask, m = -Infinity;
+        for (let k = 0; k < len; k++) {
+            const v = this.h[idx];
+            if (v > m) m = v;
+            idx = (idx - 1) & mask;
+        }
+        return m;
+    }
+
+    minL(len, back) {
+        const mask = TA_RING - 1;
+        let idx = (this.head - 1 - back) & mask, m = Infinity;
+        for (let k = 0; k < len; k++) {
+            const v = this.l[idx];
+            if (v < m) m = v;
+            idx = (idx - 1) & mask;
+        }
+        return m;
+    }
+}
+
+// S11 T2 -- mode 'off': a frozen no-op VALUE (never constructs, never tracks a bar). The
+// router resolves this while the strategy is disarmed; it can never emit.
+const TA_OFF_EVAL = Object.freeze({evaluate() {}});
+
+// S11 T2 -- the Ichimoku Cloud evaluator (per-scope singleton). Per-scope transition state
+// (prevState / lastBar / cooldown) + preallocated readout fields (tenkan/kijun/spanA/spanB
+// as NaN while warming -- null is not zero -- and a string `state`). Reads the plane only,
+// never the scope vm (contract 1: a parked VM throws on every accessor). Emission is the
+// SOLE allocation point and is reachable only through an edge + a clear cooldown (cold).
+class IchimokuEval {
+    constructor() {
+        this.prevState = 0;            // numeric prior state (+1 bull / -1 bear / 0 neutral)
+        this.lastBar = -1;             // barIndex this evaluator last ran on (contract 2)
+        this.cooldown = 0;             // bars remaining before another edge may emit
+        this.tenkan = NaN;             // readout fields: absent (NaN -> HUD '--') until warm
+        this.kijun = NaN;
+        this.spanA = NaN;
+        this.spanB = NaN;
+        this.state = 'warming';        // readout string: 'warming'|'neutral'|'bull'|'bear'
+    }
+
+    evaluate(plane, emit) {
+        // Contract 2 -- silent re-arm. An evaluator that did not run on bar i-1 (mode was
+        // 'off', or the plane re-warmed) computes an edge against a STALE prev, which is not
+        // an edge. Detect the gap, run the readout, then resync prevState without emitting.
+        const rearm = this.lastBar !== plane.barIndex - 1;
+        this.lastBar = plane.barIndex;
+        if (this.cooldown > 0) this.cooldown--;   // decrement per evaluated bar
+
+        if (plane.count < TA_WARM) {
+            // Warming: fail closed. No signal, no zero-valued spans (null is not zero).
+            this.state = 'warming';
+            this.tenkan = this.kijun = this.spanA = this.spanB = NaN;
+            this.prevState = 0;
+            return;
+        }
+
+        const tenkan = (plane.maxH(TENKAN, 0) + plane.minL(TENKAN, 0)) / 2;
+        const kijun = (plane.maxH(KIJUN, 0) + plane.minL(KIJUN, 0)) / 2;
+        // Cloud AT the price = spans computed DISP bars back (the leading span, shifted
+        // forward, sits under the current price).
+        const tenkanD = (plane.maxH(TENKAN, DISP) + plane.minL(TENKAN, DISP)) / 2;
+        const kijunD = (plane.maxH(KIJUN, DISP) + plane.minL(KIJUN, DISP)) / 2;
+        const spanANow = (tenkanD + kijunD) / 2;
+        const spanBNow = (plane.maxH(SENB, DISP) + plane.minL(SENB, DISP)) / 2;
+        // Forward cloud (the projected Senkou spans -- the readout the HUD plots).
+        const spanAFwd = (tenkan + kijun) / 2;
+        const spanBFwd = (plane.maxH(SENB, 0) + plane.minL(SENB, 0)) / 2;
+        const price = plane.cAt(0);
+        const priceD = plane.cAt(DISP);   // chikou: close now vs the close DISP bars back
+
+        this.tenkan = tenkan;
+        this.kijun = kijun;
+        this.spanA = spanAFwd;
+        this.spanB = spanBFwd;
+
+        const cloudTop = spanANow > spanBNow ? spanANow : spanBNow;
+        const cloudBot = spanANow < spanBNow ? spanANow : spanBNow;
+        let cur = 0;
+        // STATE +1: price above the cloud, tenkan over kijun, chikou above price DISP back,
+        // forward cloud bullish -- ALL FOUR. STATE -1 mirrors every one inverted.
+        if (price > cloudTop && tenkan > kijun && price > priceD && spanAFwd > spanBFwd) cur = 1;
+        else if (price < cloudBot && tenkan < kijun && price < priceD && spanAFwd < spanBFwd) cur = -1;
+
+        this.state = cur === 1 ? 'bull' : (cur === -1 ? 'bear' : 'neutral');
+
+        // A re-arm bar resyncs prev to the current state (no transition possible this bar).
+        if (rearm) {
+            this.prevState = cur;
+            return;
+        }
+        // Edge = transition INTO +1/-1 with a clear cooldown. Emission is the only alloc
+        // point and is cold by construction (edge + cooldown gate it off the per-bar path).
+        if (cur !== this.prevState && cur !== 0 && this.cooldown === 0) {
+            this.cooldown = TA_COOLDOWN_BARS;
+            emit(cur === 1 ? 'buy' : 'sell');
+        }
+        this.prevState = cur;
+    }
+}
+
+// S11 T3 -- FOURTH tick handler (runs for depth AND quote frames, live / sim / inject).
+// [HOT] one method call into applyMid (2 compares + a store). Never reads the vm.
+class CandleApply {
+    constructor(ta) {
+        this.ta = ta;
+    }
+
+    handle(f) {
+        this.ta.applyMid(f.mid);
+    }
+}
+
+// S11 T3 -- the bar-close driver, a graph-resident cron job (NOT a stray timer). roll()
+// closes any elapsed bars; interval(250) keeps sub-second latency under a throttled tab.
+class BarJob {
+    constructor(ta) {
+        this.ta = ta;
+    }
+
+    run() {
+        this.ta.roll(performance.now());
+    }
+}
+
+// Exported for the headless alloc gate (test/alloc-ta.mjs), which drives the plane +
+// evaluator directly with a synthetic clock -- the same seam-under-test pattern Frames.js
+// gives OrderBook. TA_WARM/TA_RING are the warm threshold + ring depth the gate asserts on.
+export {TaPlane, IchimokuEval, TA_WARM, TA_RING};
 
 // ---- renderers (lite-di-strategies selects one by zoom) ----
 // Zero-steady-state-alloc price labels: reformat only when the quantized (0.1)
@@ -1046,7 +1277,7 @@ class RenderSystem {
 // its OWN supervisor/health so killing one feed faults ONE scope. The registry is
 // created via createSignalScope (eager -> _resolutionOrder[0]) so it tears down LAST.
 // Cold factory: everything here runs once, at tab open, never per frame.
-function createSymbolScope(parent, {symbol, url, log, faulty, ringSize, socketFactory}) {
+function createSymbolScope(parent, {symbol, url, log, faulty, ringSize, socketFactory, barMs, taCtl, signal}) {
     const s = createSignalScope(parent, SCOPE_REGISTRY_CONFIG);   // registry pinned first (eager+throw), torn down last
     const scopeReg = s.get(SIGNAL_REGISTRY_TOKEN);
 
@@ -1075,6 +1306,12 @@ function createSymbolScope(parent, {symbol, url, log, faulty, ringSize, socketFa
     reactiveService(s, 'vm', (api) => new (makeSymbolVM(api.registry))());
     s.singletonFactory('trades:px', () => new RingBuffer(TRADE_RING));
     s.singletonFactory('trades:side', () => new RingBuffer(TRADE_RING));
+    // S11 -- the TA plane + its two strategy tokens (router-selected). No onTeardown: the
+    // plane is passive Float32 state, not a disposable, so teardown.test's SCOPE_TEARDOWN
+    // walk stays byte-identical. NON-reactive: none of these touch a lite-signal registry.
+    s.singletonFactory('ta', () => new TaPlane(barMs));
+    s.value('ta:off', TA_OFF_EVAL);
+    s.singletonFactory('ta:ichimoku', () => new IchimokuEval());
 
     const replayCtl = {on: false};                           // per-scope replay gate
     s.value('replayCtl', replayCtl);
@@ -1092,6 +1329,7 @@ function createSymbolScope(parent, {symbol, url, log, faulty, ringSize, socketFa
     // recorder ring across the 50x churn gate (G2).
     const bus = new EventBus(s);
     bus.on('tick', TapeApply, ['tape']).on('tick', AggApply, ['vm', 'feedGate'])
+        .on('tick', CandleApply, ['ta'])                 // S11: aggregate f.mid into OHLC candles (HOT)
         .on('trade', TradeApply, ['trades:px', 'trades:side']);
     s.singletonFactory('bus', () => bus);
     s.onTeardown('bus', (b) => {
@@ -1116,7 +1354,7 @@ function createSymbolScope(parent, {symbol, url, log, faulty, ringSize, socketFa
     // per-scope feed lifecycle + counters (all scope-local, no module globals)
     let feedUrl = url, sock = null;
     let quoteCount = 0, depthCount = 0, tradeCount = 0, qps = 0, trps = 0, lastQ = 0, lastT = 0;
-    let book = null, tape = null, vm = null, tradePx = null, tradeSide = null;
+    let book = null, tape = null, vm = null, tradePx = null, tradeSide = null, ta = null, taEval = null;
     let alertResetPending = false;                            // set on unpin, cleared on the reset-logging quote
 
     // Single cold dispatch seam (the ONLY place the wire tag is inspected). book is
@@ -1281,7 +1519,8 @@ function createSymbolScope(parent, {symbol, url, log, faulty, ringSize, socketFa
     const scron = new Cron(s, {tickMs: POLL_MS});
     scron.job('poll', PollJob, interval(POLL_MS), {deps: ['pollctl']})
         .job('failover', FailoverJob, interval(1000), {deps: ['failover']})
-        .job('rate', RateJob, interval(1000), {deps: ['ratectl']});
+        .job('rate', RateJob, interval(1000), {deps: ['ratectl']})
+        .job('bar', BarJob, interval(250), {deps: ['ta']});   // S11: close TA candles ~4 Hz
 
     s.boot();
     bus.boot();
@@ -1292,10 +1531,31 @@ function createSymbolScope(parent, {symbol, url, log, faulty, ringSize, socketFa
     book = s.get('book');
     tape = s.get('tape');
     vm = s.get('vm');
+    ta = s.get('ta');                                    // S11: resolve the plane right after vm (no teardown hook -> not in the walk)
+    taEval = s.get('ta:ichimoku');                       // the ichimoku singleton (test seam + router target)
     tradePx = s.get('trades:px');
     tradeSide = s.get('trades:side');
     s.get('bus');
     s.get('traceBus');
+
+    // S11 -- edge-triggered signal emission (COLD: reachable only through an edge + a clear
+    // cooldown). Builds the payload from the plane + scope identity, forwards it to the
+    // injected sink AND narrates it to the log. Never reads the vm (contract 1).
+    const emitSignal = (side) => {
+        const price = ta.cAt(0);
+        const bar = ta.barIndex;
+        if (signal) signal({symbol, strategy: 'ichimoku', side, price, bar, at: performance.now()});
+        log('signal', symbol + ' STRONG ' + side.toUpperCase() + ' (ichimoku) @ ' + price.toFixed(2) + ' -- bar ' + bar);
+    };
+    // Per-scope router: the global taCtl.mode gate selects a TRADING strategy token. resolve()
+    // returns the SAME cached ta:off VALUE or ta:ichimoku singleton (== taEval), so the readout
+    // fields state() reads are the ones evaluate() just wrote. Mode is global, one at a time.
+    const taRouter = new StrategyRouter(s, {
+        strategies: {off: 'ta:off', ichimoku: 'ta:ichimoku'},
+        gate: () => taCtl.mode,
+    });
+    ta.onBar = () => taRouter.resolve(taCtl.mode).evaluate(ta, emitSignal);
+    ta.onDegrade = () => log('degrade', symbol + ': TA plane stalled > ' + TA_RING + ' bars -- rings reset, re-warming');
 
     let nodeCount = 0;
     try {
@@ -1307,6 +1567,7 @@ function createSymbolScope(parent, {symbol, url, log, faulty, ringSize, socketFa
     return {
         symbol, scope: s, registry: scopeReg, feedGate, nodeCount,   // registry + feedGate: S9 watchlist park/revive seams
         book, tape, vm, tradePx, tradeSide, feedPoll, inject,
+        ta, taEval,                                      // S11 test seams: the plane + the ichimoku evaluator
         sup,                                             // test seam (S6): heal.test.mjs reaches the per-scope supervisor to reportFault
         async start() {
             await sup.start();                               // resolves 'feed' -> opens the socket
@@ -1330,6 +1591,16 @@ function createSymbolScope(parent, {symbol, url, log, faulty, ringSize, socketFa
             // while still the active tab, read ZERO for the reactive fields -- gate on the flag,
             // never try/catch a throw into a value. The socket/health fields below are unaffected.
             const gLive = feedGate.live;
+            // S11 TA readout (plane + evaluator, NOT the vm -- the plane is never parked).
+            // taState composes the display string; spans stay NaN (HUD '--') until warm AND
+            // while the strategy is off -- null is not zero, an off/warming readout shows
+            // absence, never a 0-valued or last-computed stale span.
+            const warm = ta.count >= TA_WARM;
+            const evOn = taCtl.mode !== 'off';
+            let taState;
+            if (taCtl.mode === 'off') taState = 'off';
+            else if (!warm) taState = 'warming ' + ((ta.count / TA_WARM * 100) | 0) + '%';
+            else taState = taEval.state;
             return {
                 mid: gLive ? vm.mid : 0, bid: gLive ? vm.bid : 0, ask: gLive ? vm.ask : 0,
                 spread: gLive ? vm.spread : 0, qps: tpsSig(), trps,
@@ -1338,6 +1609,9 @@ function createSymbolScope(parent, {symbol, url, log, faulty, ringSize, socketFa
                 readyz: health.readyz(), livez: health.livez(), supState: sup.state, restarts,
                 recorded: traceBus.recorded(), status, latency, attempts, open,
                 ticks: quoteCount + depthCount + tradeCount,
+                taState, taWarm: warm, taBars: ta.count,
+                tenkan: evOn ? taEval.tenkan : NaN, kijun: evOn ? taEval.kijun : NaN,
+                spanA: evOn ? taEval.spanA : NaN, spanB: evOn ? taEval.spanB : NaN,
             };
         },
         // Alert threshold pin/unpin (cold, one click per intent). Pin freezes the tracked
@@ -1405,7 +1679,7 @@ function createSymbolScope(parent, {symbol, url, log, faulty, ringSize, socketFa
 
 // pure DI applied to the DI demo: the two host imports (the ws socket factory and the
 // lite-gl sink factories) are injectable so bootKernel runs headless under node:test.
-export async function bootKernel({ctx, gl, w, h, dpr, onEvent, onMode, ringSize, socketFactory = createSocketFactory, glSinks = defaultGlSinks}) {
+export async function bootKernel({ctx, gl, w, h, dpr, onEvent, onMode, onSignal, ringSize, barMs: barMsOpt, socketFactory = createSocketFactory, glSinks = defaultGlSinks}) {
     const bootAt = performance.now();                        // S5 uptime origin (re-captured on re-boot)
     const log = (kind, msg) => onEvent && onEvent(kind, msg);
 
@@ -1445,6 +1719,26 @@ export async function bootKernel({ctx, gl, w, h, dpr, onEvent, onMode, ringSize,
         const memD = nav && typeof nav.deviceMemory === 'number' ? nav.deviceMemory : 'unknown';
         log('degrade', 'degrade: ring ' + RING_MAX + ' -> ' + ring + ' (deviceMemory=' + memD + ')');
     }
+
+    // S11 -- candle timeframe, resolved ONCE at boot (mirrors the ?ring pattern above):
+    // explicit {barMs} option wins; else ?bar=N URL override clamped [250, 60000]; else the
+    // default. A non-default value is logged once. Fail closed: a <=0 barMs would spin roll().
+    let barMs = barMsOpt;
+    if (barMs === undefined) {
+        if (params && params.has('bar')) {
+            const b = parseInt(params.get('bar'), 10);
+            if (Number.isFinite(b) && b > 0) barMs = b < 250 ? 250 : (b > 60000 ? 60000 : b);
+        }
+        if (barMs === undefined) barMs = BAR_MS_DEFAULT;
+        else log('heal', 'ta: bar timeframe -> ' + barMs + 'ms (?bar override)');
+    }
+    if (!(barMs > 0)) barMs = BAR_MS_DEFAULT;
+    // The global strategy selector: a plain CLOSURE object (zero parent-graph delta, fresh
+    // per boot), handed to every scope. off by default; setTaMode flips it.
+    const taCtl = {mode: 'off'};
+    // The signal sink forwards every emitted STRONG BUY/SELL to the injected onSignal (absent
+    // = log-only, normal headless). The scope's emitSignal also logs it; this is the UI path.
+    const signalSink = (sig) => { if (onSignal) onSignal(sig); };
 
     const viz = {
         ctx, w, h, dpr: dpr || 1, zoom: 1, router: null, active: null, scratch: new Float32Array(ring),
@@ -1623,7 +1917,7 @@ export async function bootKernel({ctx, gl, w, h, dpr, onEvent, onMode, ringSize,
             setActive(sym);
             return scopes.get(sym);
         }
-        const h = createSymbolScope(c, {symbol: sym, url: u, log, faulty, ringSize: ring, socketFactory});
+        const h = createSymbolScope(c, {symbol: sym, url: u, log, faulty, ringSize: ring, socketFactory, barMs, taCtl, signal: signalSink});
         await h.start();
         scopes.set(sym, h);
         // Register a LIVE watchlist entry over the freshly cold-constructed scope. Fail closed
@@ -1699,6 +1993,9 @@ export async function bootKernel({ctx, gl, w, h, dpr, onEvent, onMode, ringSize,
                 longTasks: perf.longTasks, longWorst: perf.longWorst,
                 heapMB: perf.heapMB, uptimeMs: performance.now() - bootAt,
                 ringUse: 0, burstActive: viz.burstActive,
+                // S11 TA plane (global mode + active scope's readout; absent-safe defaults).
+                taMode: taCtl.mode, taState: 'off', taWarm: false, taBars: 0,
+                tenkan: NaN, kijun: NaN, spanA: NaN, spanB: NaN,
             };
             if (!h) return base;
             const st = h.state();
@@ -1723,6 +2020,13 @@ export async function bootKernel({ctx, gl, w, h, dpr, onEvent, onMode, ringSize,
             base.open = st.open;
             base.ticks = st.ticks;
             base.ringUse = (h.tape && h.tape.count) ? h.tape.count / ring : 0;   // S5: active-ring occupancy (guarded)
+            base.taState = st.taState;
+            base.taWarm = st.taWarm;
+            base.taBars = st.taBars;
+            base.tenkan = st.tenkan;
+            base.kijun = st.kijun;
+            base.spanA = st.spanA;
+            base.spanB = st.spanB;
             return base;
         },
         setZoom(z) {
@@ -1822,6 +2126,21 @@ export async function bootKernel({ctx, gl, w, h, dpr, onEvent, onMode, ringSize,
             if (h) h.unpinAlert();
         },
         swapRenderer,
+        // S11 -- the global strategy selector. Fail closed on a mis-shaped mode with the
+        // REAL cause (named TypeError enumerating the valid modes), never a silent ignore.
+        // Off-able; the switch is global (one strategy at a time) and takes effect on the
+        // next bar close across every scope (the plane re-arms silently per contract 2).
+        setTaMode(mode) {
+            if (TA_MODES.indexOf(mode) === -1) {
+                throw new TypeError('setTaMode: unknown strategy "' + String(mode)
+                    + '" -- expected one of ' + TA_MODES.join(' | '));
+            }
+            taCtl.mode = mode;
+            log('heal', 'ta: strategy -> ' + mode);
+        },
+        taMode() {
+            return taCtl.mode;
+        },
         addSymbol,
         closeSymbol,
         setActive,

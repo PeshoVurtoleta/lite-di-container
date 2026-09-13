@@ -34,7 +34,9 @@
     "@zakkster/lite-ws":             "https://esm.sh/@zakkster/lite-ws@1.0.0",
     "@zakkster/lite-ring-buffer":    "https://esm.sh/@zakkster/lite-ring-buffer@1.0.1",
     "@zakkster/lite-gl":             "https://esm.sh/@zakkster/lite-gl@2.0.0",
-    "@zakkster/lite-gl/backend":     "https://esm.sh/@zakkster/lite-gl@2.0.0/backend"
+    "@zakkster/lite-gl/backend":     "https://esm.sh/@zakkster/lite-gl@2.0.0/backend",
+    "@zakkster/lite-headless/toast": "https://esm.sh/@zakkster/lite-headless@1.11.0/toast?deps=@zakkster/lite-signal@1.5.0",
+    "@zakkster/lite-headless/notification-center": "https://esm.sh/@zakkster/lite-headless@1.11.0/notification-center?deps=@zakkster/lite-signal@1.5.0"
   }
 }
 
@@ -551,6 +553,215 @@
             margin-top: auto;
             padding-top: 0.5rem;
         }
+
+        .log .signal {
+            color: var(--ok);
+            font-weight: 600;
+        }
+
+        /* S11 strategy segmented control */
+        .seg {
+            display: inline-flex;
+            border: 1px solid var(--line2);
+            border-radius: 0.5rem;
+            overflow: hidden;
+            margin-bottom: 0.5rem;
+        }
+
+        .seg-btn {
+            appearance: none;
+            border: 0;
+            background: var(--panel2);
+            color: var(--soft);
+            font-family: var(--mono);
+            font-size: .68rem;
+            letter-spacing: 0.04em;
+            padding: 0.3rem 0.7rem;
+            cursor: pointer;
+        }
+
+        .seg-btn + .seg-btn {
+            border-left: 1px solid var(--line2);
+        }
+
+        @media (hover: hover) {
+            .seg-btn:hover {
+                color: var(--ink);
+            }
+        }
+
+        .seg-btn.on {
+            background: var(--accent);
+            color: #06110F;
+        }
+
+        #ta-state.bull {
+            color: var(--ok);
+        }
+
+        #ta-state.bear {
+            color: var(--ember);
+        }
+
+        /* S11 lite-headless toast viewport (top-right) + card */
+        .toast-viewport {
+            position: fixed;
+            top: 1rem;
+            right: 1rem;
+            z-index: 60;
+            display: flex;
+            flex-direction: column;
+            gap: 0.5rem;
+            width: min(20rem, 90vw);
+            pointer-events: none;
+        }
+
+        .toast-card {
+            pointer-events: auto;
+            background: #10151E;
+            background: var(--panel);
+            border: 1px solid var(--line2);
+            border-left: 3px solid var(--accent);
+            border-radius: 0.5rem;
+            padding: 0.6rem 0.75rem;
+            color: var(--ink);
+            font-size: .78rem;
+            box-shadow: 0 0.5rem 1.5rem rgba(0, 0, 0, 0.45);
+            transform: translateX(var(--lh-toast-swipe-x, 0));
+        }
+
+        .toast-card.sell {
+            border-left-color: var(--ember);
+        }
+
+        .toast-card .toast-title {
+            font-family: var(--mono);
+            font-weight: 600;
+            letter-spacing: 0.03em;
+        }
+
+        .toast-card .toast-body {
+            color: var(--soft);
+            font-size: .72rem;
+            margin-top: 0.15rem;
+        }
+
+        /* S11 notification-center bell + badge + panel */
+        .nc-bell {
+            position: fixed;
+            top: 1rem;
+            left: 1rem;
+            z-index: 61;
+            appearance: none;
+            display: inline-flex;
+            align-items: center;
+            gap: 0.4rem;
+            background: var(--panel);
+            color: var(--soft);
+            border: 1px solid var(--line2);
+            border-radius: 999px;
+            padding: 0.35rem 0.7rem;
+            font-family: var(--mono);
+            font-size: .7rem;
+            cursor: pointer;
+        }
+
+        @media (hover: hover) {
+            .nc-bell:hover {
+                color: var(--ink);
+            }
+        }
+
+        .nc-badge {
+            min-width: 1.1rem;
+            padding: 0 0.3rem;
+            border-radius: 999px;
+            background: var(--crit);
+            color: #06110F;
+            font-weight: 700;
+            font-size: .66rem;
+            text-align: center;
+        }
+
+        .nc-badge[data-nc-hidden] {
+            display: none;
+        }
+
+        .nc-panel {
+            position: fixed;
+            top: 3.2rem;
+            left: 1rem;
+            z-index: 61;
+            width: min(20rem, 90vw);
+            max-height: 60dvh;
+            overflow-y: auto;
+            background: var(--panel);
+            border: 1px solid var(--line2);
+            border-radius: 0.6rem;
+            box-shadow: 0 0.75rem 2rem rgba(0, 0, 0, 0.5);
+        }
+
+        .nc-panel[hidden] {
+            display: none;
+        }
+
+        .nc-head {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 0.55rem 0.75rem;
+            border-bottom: 1px solid var(--line);
+            font-family: var(--mono);
+            font-size: .72rem;
+            color: var(--soft);
+        }
+
+        .nc-head button {
+            appearance: none;
+            border: 1px solid var(--line2);
+            background: var(--panel2);
+            color: var(--muted);
+            border-radius: 0.4rem;
+            font-size: .66rem;
+            padding: 0.15rem 0.5rem;
+            cursor: pointer;
+        }
+
+        .nc-list {
+            padding: 0.35rem;
+        }
+
+        .nc-empty {
+            color: var(--muted);
+            font-size: .72rem;
+            padding: 0.75rem;
+            text-align: center;
+        }
+
+        .nc-item {
+            padding: 0.5rem 0.6rem;
+            border-radius: 0.45rem;
+            border-left: 3px solid var(--accent);
+            background: var(--panel2);
+            margin-bottom: 0.35rem;
+        }
+
+        .nc-item.warning {
+            border-left-color: var(--ember);
+        }
+
+        .nc-item .nc-title {
+            font-family: var(--mono);
+            font-size: .72rem;
+            font-weight: 600;
+            color: var(--ink);
+        }
+
+        .nc-item .nc-body {
+            font-size: .7rem;
+            color: var(--soft);
+            margin-top: 0.1rem;
+        }
     </style>
 </head>
 <body>
@@ -583,6 +794,20 @@
                 <div class="row"><span class="k">quotes / s</span><span class="v" id="qps">--</span></div>
                 <div class="row"><span class="k">trades / s</span><span class="v" id="trps">--</span></div>
                 <div class="row"><span class="k">ladder</span><span class="v accent" id="ladder">--</span></div>
+            </div>
+        </div>
+
+        <div class="group">
+            <h2>Strategy plane &middot; lite-di-strategies + Ichimoku</h2>
+            <div class="seg" id="ta-seg" role="group" aria-label="strategy">
+                <button type="button" class="seg-btn on" data-mode="off">OFF</button>
+                <button type="button" class="seg-btn" data-mode="ichimoku">ICHIMOKU</button>
+            </div>
+            <div class="rows">
+                <div class="row"><span class="k">state</span><span class="v accent" id="ta-state">off</span></div>
+                <div class="row"><span class="k">tenkan / kijun</span><span class="v" id="ta-tk">--</span></div>
+                <div class="row"><span class="k">span A / B</span><span class="v" id="ta-span">--</span></div>
+                <div class="row"><span class="k">closed bars <small>78 to warm</small></span><span class="v" id="ta-bars">0</span></div>
             </div>
         </div>
 
@@ -676,8 +901,24 @@
     </aside>
 </div>
 
+<!-- S11 lite-headless surfaces: the notification-center bell/badge/panel + the toast viewport.
+     Factories only (createNotificationCenter / createToast); the /element wrappers are never imported. -->
+<button type="button" class="nc-bell" id="nc-bell" aria-label="signal notifications" aria-expanded="false">
+    <span>Signals</span>
+    <span class="nc-badge" id="nc-badge" data-nc-hidden>0</span>
+</button>
+<div class="nc-panel" id="nc-panel" hidden>
+    <div class="nc-head"><span>Strong signals</span><button type="button" id="nc-clear">clear</button></div>
+    <div class="nc-list" id="nc-list"></div>
+</div>
+<div class="toast-viewport" id="toast-vp" aria-label="signal alerts"></div>
+
 <script type="module">
     import {bootKernel, WATCHLIST_CAP} from './kernel.js';
+    // S11 -- lite-headless FACTORIES only (never the /element wrappers). The ?deps pin in
+    // the import map hands esm.sh the SAME lite-signal@1.5.0 the app uses (one instance).
+    import {createToast} from '@zakkster/lite-headless/toast';
+    import {createNotificationCenter} from '@zakkster/lite-headless/notification-center';
 
     const SUP = ['INIT', 'RUNNING', 'ESCALATED', 'SHUT_DOWN'];
     const TAB_POOL = 8;                                  // fixed tab element pool; reused, never rebuilt wholesale
@@ -820,7 +1061,91 @@
         // S9 watchlist panel.
         wlList: $('wl-list'), wlCycles: $('wl-cycles'), wlPoolgrowths: $('wl-poolgrowths'),
         wlNodesDelta: $('wl-nodes-delta'),
+        // S11 strategy plane HUD + lite-headless surfaces.
+        taSeg: $('ta-seg'), taState: $('ta-state'), taTk: $('ta-tk'), taSpan: $('ta-span'), taBars: $('ta-bars'),
+        ncBell: $('nc-bell'), ncBadge: $('nc-badge'), ncPanel: $('nc-panel'), ncList: $('nc-list'), ncClear: $('nc-clear'),
+        toastVp: $('toast-vp'),
     };
+
+    // S11 -- lite-headless surfaces, built ONCE. The toast viewport shows a transient card
+    // per STRONG signal; the notification-center keeps the running list behind the bell with
+    // an unread badge. Both are fed ONLY by onSignal (cold: kernel gates it by edge+cooldown).
+    let lastTa = '';                                     // change-gate the whole TA HUD line
+    const toast = createToast({placement: 'top-right', duration: 6000, maxStack: 4});
+    toast.attachRoot(el.toastVp);
+    const center = createNotificationCenter({maxItems: 50, onChange: renderCenter});
+    center.attachUnreadBadge(el.ncBadge);
+
+    // Build the signal list DOM (COLD: on add / clear only, never per frame).
+    function renderCenter(items) {
+        el.ncList.textContent = '';
+        if (!items.length) {
+            const empty = document.createElement('div');
+            empty.className = 'nc-empty';
+            empty.textContent = 'no signals yet';
+            el.ncList.appendChild(empty);
+            return;
+        }
+        for (let i = 0; i < items.length; i++) {
+            const n = items[i];
+            const item = document.createElement('div');
+            item.className = 'nc-item ' + (n.kind === 'warning' ? 'warning' : 'success');
+            const title = document.createElement('div');
+            title.className = 'nc-title';
+            title.textContent = n.title;
+            const body = document.createElement('div');
+            body.className = 'nc-body';
+            body.textContent = n.body;
+            item.append(title, body);
+            el.ncList.appendChild(item);
+        }
+    }
+    renderCenter([]);
+
+    // The onSignal sink threaded into bootKernel. buy -> success/teal, sell -> warning/ember.
+    // The center id is unique per (symbol,strategy,side,bar) so a re-fire on the SAME bar
+    // dedups instead of stacking (the kernel cooldown makes a same-bar re-fire rare anyway).
+    function onSignal(sig) {
+        const dir = sig.side === 'buy' ? 'BUY' : 'SELL';
+        const title = sig.symbol + ' STRONG ' + dir;
+        const body = sig.strategy + ' @ ' + sig.price.toFixed(2) + ' -- bar ' + sig.bar;
+        const card = document.createElement('div');
+        card.className = 'toast-card ' + (sig.side === 'buy' ? 'buy' : 'sell');
+        const t = document.createElement('div');
+        t.className = 'toast-title';
+        t.textContent = title;
+        const b = document.createElement('div');
+        b.className = 'toast-body';
+        b.textContent = body;
+        card.append(t, b);
+        toast.show(card, {urgent: true, duration: 6000});
+        center.add({
+            id: sig.symbol + '-' + sig.strategy + '-' + sig.side + '-' + sig.bar,
+            title, body, kind: sig.side === 'buy' ? 'success' : 'warning',
+        });
+    }
+
+    // Strategy segmented control -> handle.setTaMode (one delegated click). Reflect the mode
+    // by toggling .on. The buttons carry only valid data-mode values, so setTaMode never
+    // sees an unknown mode from here; a missing handle is a guarded no-op.
+    function reflectTaMode(mode) {
+        const btns = el.taSeg.children;
+        for (let i = 0; i < btns.length; i++) btns[i].classList.toggle('on', btns[i].dataset.mode === mode);
+    }
+    el.taSeg.addEventListener('click', (e) => {
+        const btn = e.target.closest('.seg-btn');
+        if (!btn || !handle) return;
+        handle.setTaMode(btn.dataset.mode);
+        reflectTaMode(handle.taMode());
+    });
+
+    // Bell toggles the panel; clear empties the center.
+    el.ncBell.addEventListener('click', () => {
+        const open = el.ncPanel.hasAttribute('hidden');
+        el.ncPanel.toggleAttribute('hidden', !open);
+        el.ncBell.setAttribute('aria-expanded', open ? 'true' : 'false');
+    });
+    el.ncClear.addEventListener('click', () => center.clearAll());
 
     // Tab strip: a fixed pool of button elements built ONCE + a trailing +add button.
     // renderTabs() mutates the pool in place (text/dataset/class) -- it never rebuilds
@@ -1020,7 +1345,7 @@
     async function boot() {
         size();
         try {
-            handle = await bootKernel({ctx, gl, w: W, h: H, dpr, onEvent: pushLog, onMode: setMode});
+            handle = await bootKernel({ctx, gl, w: W, h: H, dpr, onEvent: pushLog, onMode: setMode, onSignal});
         } catch (e) {
             handle = null;
             el.err.hidden = false;
@@ -1034,6 +1359,8 @@
         cv.classList.remove('hidden');
         setShutState(false);
         pushLog('heal', 'boot: kernel re-registered -- ' + handle.readState().nodeCount + ' graph nodes wired');
+        reflectTaMode(handle.taMode());                  // S11: reflect the strategy mode (off on a fresh boot)
+        lastTa = '';                                     // force the TA HUD line to repaint after a re-boot
         renderTabs();
         renderWatchlist();
     }
@@ -1183,6 +1510,17 @@
         const upS = (s.uptimeMs / 1000) | 0, upM = (upS / 60) | 0;
         el.uptime.textContent = upM + 'm ' + (upS % 60) + 's';
         el.heap.textContent = s.heapMB == null ? 'n/a' : s.heapMB.toFixed(1) + ' MB';
+        // S11 TA HUD -- change-gate the WHOLE line (the session-13 lesson). Writes only, no
+        // layout reads. Warming/off spans render '--' (fmt gates NaN); never a 0-valued span.
+        const taLine = s.taState + '|' + s.tenkan + '|' + s.kijun + '|' + s.spanA + '|' + s.spanB + '|' + s.taBars;
+        if (taLine !== lastTa) {
+            lastTa = taLine;
+            el.taState.textContent = s.taState;
+            el.taState.className = 'v ' + (s.taState === 'bull' ? 'accent bull' : (s.taState === 'bear' ? 'bear' : 'accent'));
+            el.taTk.textContent = fmt(s.tenkan) + ' / ' + fmt(s.kijun);
+            el.taSpan.textContent = fmt(s.spanA) + ' / ' + fmt(s.spanB);
+            el.taBars.textContent = s.taBars;
+        }
         // Self-narrating soak line, change-gated on the WHOLE string (the audio-rooms lesson).
         const foot = 'uptime ' + upM + 'm -- ' + (s.longTasks < 0 ? 'n/a' : s.longTasks)
             + ' long tasks -- worst frame ' + s.worst.toFixed(0) + 'ms -- restarts ' + s.restarts;

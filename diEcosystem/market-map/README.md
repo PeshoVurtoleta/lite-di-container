@@ -246,6 +246,44 @@ per-scope `defineReactive` wrapper class all survive. Three caveats worth statin
   below the ceiling until every derived has been exercised. Size a registry from `costOf`,
   never from the live probe.
 
+### The strategy plane (Ichimoku signals)
+
+The **Strategy plane** panel adds a per-scope TA (technical-analysis) lane on top of the
+same tick firehose. It is `lite-di-strategies` finally selecting a TRADING strategy rather
+than a renderer: a segmented `OFF | ICHIMOKU` control drives a per-scope `StrategyRouter`
+whose tokens are `ta:off` (a frozen no-op) and `ta:ichimoku` (an Ichimoku Cloud evaluator).
+The mode is global and off by default; one strategy runs at a time, and it is off-able.
+
+- **Non-reactive, per-symbol, zero-GC.** The plane (`TaPlane`) is a plain class holding four
+  `Float32Array` OHLC candle rings -- it registers ZERO `lite-signal` nodes and never reads
+  the scope VM (a parked watchlist VM throws on every accessor), so watchlist symbols keep
+  evaluating while parked. `f.mid` is aggregated into the open candle at the same dispatch
+  seam a real tick takes (`CandleApply`, a fourth `event-bus` `tick` handler); a `BarJob`
+  cron closes bars on a wall clock. `applyMid` is a hot body (two compares + a store, no
+  time read); the bar-close roll + evaluate lane is steady-state 0-alloc (an O(52) backward
+  ring scan, preallocated readout fields). Signal emission is the only allocation point and
+  is reachable only through an edge plus a clear cooldown -- cold by construction.
+
+- **The `?bar` override + 78-bar warm-up.** Candles default to a `BAR_MS_DEFAULT = 1000` ms
+  timeframe; `?bar=N` (clamped `[250, 60000]`) overrides it -- `?bar=250` warms in ~20 s for
+  a live browser check. Ichimoku needs `SENB (52) + DISP (26) = 78` CLOSED bars before it
+  computes anything. Until then the readout is `warming n%` and the tenkan / kijun / span
+  A / span B cells show `--`: a warming readout shows ABSENCE (`NaN`-gated), never a
+  zero-valued span (null is not zero). On the 78th closed bar the state computes; a
+  transition INTO strong-bull (`+1`) or strong-bear (`-1`) with a clear 30-bar cooldown is
+  an edge. Strong-bull requires ALL FOUR: price above the cloud, tenkan over kijun, chikou
+  above the price 26 bars back, and a bullish forward cloud; strong-bear mirrors every one.
+
+- **The notification path.** An edge calls the injectable `{onSignal}` `bootKernel` sink,
+  which surfaces the signal through `@zakkster/lite-headless` `toast` (a transient card,
+  top-right) and `notification-center` (a running list behind a bell with an unread badge).
+  Both are wired with the FACTORIES (`createToast` / `createNotificationCenter`); the
+  `/element` wrappers are never imported. Absent `onSignal` (headless), the edge still logs.
+
+These are the textbook Ichimoku indicator definitions rendered for a demo -- **not trading
+advice.** (`Float32` mids at six-figure prices carry a ~0.01 quantum; indicator comparisons
+are relative, so this is fine for the demo, same posture as the tape ring.)
+
 ## Perf & exports
 
 The **Perf & soak** HUD group makes the zero-GC / self-healing claims measurable on
